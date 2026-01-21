@@ -1,0 +1,5 @@
+include README.md
+recursive-include pwnagotchi *.py
+recursive-include pwnagotchi/locale *.mo
+recursive-include pwnagotchi/ui/web/templates *.html
+recursive-include pwnagotchi/ui/web/static *

@@ -131,7 +131,7 @@ class Voice:
             self._('I\'m angrier than a Zeep Xanflorp!'),
             self._('This is worse than that time with the squirrels!'),
             self._('I\'m gonna need a lot of alcohol to forget this!'),
-            self._('You\'re like Hitler, but even Hitler cared about Germany or something!'),
+            self._('I\'m absolutely furious right now!'),
             self._('I\'m as mad as Birdperson at a Federation rally!')])
 
     def on_excited(self):
