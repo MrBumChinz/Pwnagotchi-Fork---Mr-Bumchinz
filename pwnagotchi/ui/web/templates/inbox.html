@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% set active_page = "inbox" %}
+
+{% block title %}
+{{ name }} Inbox | Pwnagotchi
+{% endblock %}
+
+{% block script %}
+$(function() {
+    // Auto-refresh every 15 seconds
+    setTimeout(function(){
+        window.location.reload(true);
+    }, 15000);
+    
+    // Show refresh countdown
+    var countdown = 15;
+    setInterval(function() {
+        countdown--;
+        if (countdown > 0) {
+            $('#refresh-timer').text('Refreshing in ' + countdown + 's');
+        }
+    }, 1000);
+});
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>📥 Inbox</h1>
+    <p>
+        {{ inbox.records }} message{{ 's' if inbox.records != 1 else '' }}
+        <span id="refresh-timer" style="margin-left: 15px; font-size: 0.85rem; color: var(--text-secondary);">Refreshing in 15s</span>
+    </p>
+</div>
+
+<div style="padding: 20px;">
+    {% if inbox.messages %}
+    <ul class="inbox" data-role="listview" data-filter="true" data-filter-placeholder="🔍 Search messages..." data-inset="true">
+        {% for message in inbox.messages %}
+        <li class="message">
+            <a href="/inbox/{{ message.id }}" class="{{ 'unread' if not message.seen_at else 'read' }}">
+                <h2>
+                    {% if not message.seen_at %}🔵{% endif %}
+                    {{ message.sender_name }}@{{ message.sender[:8] }}...
+                </h2>
+                <p>
+                    📨 Received <time class="timeago" datetime="{{ message.created_at }}">{{ message.created_at }}</time>
+                    {% if message.seen_at %}
+                    <br>👁️ Seen <time class="timeago" datetime="{{ message.seen_at }}">{{ message.seen_at }}</time>
+                    {% endif %}
+                </p>
+            </a>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <div class="card" style="text-align: center; padding: 40px;">
+        <div style="font-size: 4rem; margin-bottom: 20px;">📭</div>
+        <h3 style="color: var(--text-secondary);">No messages yet</h3>
+        <p style="color: var(--text-secondary);">Your inbox is empty. Go meet some pwnagotchi friends!</p>
+    </div>
+    {% endif %}
+</div>
+
+{% if inbox.pages > 1 %}
+<div style="padding: 20px; text-align: center;">
+    <div class="action-buttons" style="display: inline-flex;">
+        {% if page > 1 %}
+        <a href="/inbox?p={{ page - 1 }}" class="button">⬅️ Previous</a>
+        {% endif %}
+        <span style="padding: 12px 20px; color: var(--text-secondary);">Page {{ page }} of {{ inbox.pages }}</span>
+        {% if page < inbox.pages %}
+        <a href="/inbox?p={{ page + 1 }}" class="button">Next ➡️</a>
+        {% endif %}
+    </div>
+</div>
+{% endif %}
+{% endblock %}

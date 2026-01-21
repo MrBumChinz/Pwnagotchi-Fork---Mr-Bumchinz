@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% set active_page = "inbox" %}
+
+{% block title %}
+Message from {{ message.sender_name }} | Pwnagotchi
+{% endblock %}
+
+{% block script %}
+jQuery(document).ready(function() {
+    // Mark the message as read
+    jQuery.get("/inbox/{{ message.id }}/seen", function(res){ console.log(res); });
+});
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>📧 Message</h1>
+    <p>From {{ message.sender_name }}</p>
+</div>
+
+<div style="padding: 20px;">
+    <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px; flex-wrap: wrap; gap: 15px;">
+            <div>
+                <h3 style="color: var(--accent-color); margin-bottom: 5px;">
+                    🤖 {{ message.sender_name }}
+                </h3>
+                <p style="color: var(--text-secondary); font-family: monospace; font-size: 0.85rem;">
+                    {{ message.sender[:24] }}...
+                </p>
+            </div>
+            <div style="text-align: right;">
+                <p style="color: var(--text-secondary); font-size: 0.9rem;">
+                    📨 <time class="timeago" datetime="{{ message.created_at }}">{{ message.created_at }}</time>
+                </p>
+                {% if message.seen_at %}
+                <p style="color: var(--text-secondary); font-size: 0.85rem;">
+                    👁️ <time class="timeago" datetime="{{ message.seen_at }}">{{ message.seen_at }}</time>
+                </p>
+                {% endif %}
+            </div>
+        </div>
+        
+        <div style="background: var(--secondary-bg); border-radius: 12px; padding: 25px; margin-bottom: 20px;">
+            {% if message.data %}
+            <p style="white-space: pre-line; line-height: 1.8;">{{ message.data }}</p>
+            {% else %}
+            <p style="color: var(--text-secondary); font-style: italic;">💭 This message is empty.</p>
+            {% endif %}
+        </div>
+        
+        <div class="action-buttons" style="margin: 0; padding: 0; background: transparent;">
+            <a href="/inbox/new?to={{ message.sender }}" class="button">
+                💬 Reply
+            </a>
+            <a href="/inbox/{{ message.id }}/deleted" class="button btn-danger" 
+               onclick="return confirm('⚠️ Delete this message?');">
+                🗑️ Delete
+            </a>
+        </div>
+    </div>
+    
+    <div style="text-align: center; margin-top: 20px;">
+        <a href="/inbox" class="button" style="display: inline-block;">
+            ⬅️ Back to Inbox
+        </a>
+    </div>
+</div>
+{% endblock %}

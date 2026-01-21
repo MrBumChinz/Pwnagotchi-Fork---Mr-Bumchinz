@@ -1,0 +1,699 @@
+{% extends "base.html" %}
+{% set active_page = "themes" %}
+
+{% block title %}
+Theme Manager | Pwnagotchi
+{% endblock %}
+
+{% block styles %}
+{{ super() }}
+<style>
+    .theme-manager-header {
+        padding: 30px 20px;
+        background: linear-gradient(135deg, var(--secondary-bg), var(--card-bg));
+        border-bottom: 2px solid var(--accent-color);
+        text-align: center;
+    }
+    
+    .theme-manager-header h1 {
+        font-size: 2rem;
+        background: linear-gradient(135deg, var(--gradient-start), var(--gradient-end));
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 10px;
+    }
+    
+    .current-theme-info {
+        background: var(--card-bg);
+        border: 2px solid var(--accent-color);
+        border-radius: 16px;
+        padding: 25px;
+        margin: 20px;
+        box-shadow: 0 0 30px var(--glow-color);
+    }
+    
+    .current-theme-info .label {
+        color: var(--text-secondary);
+        font-size: 0.9rem;
+        text-transform: uppercase;
+        margin-bottom: 5px;
+    }
+    
+    .current-theme-info .value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: var(--accent-color);
+    }
+    
+    .theme-tabs {
+        display: flex;
+        gap: 10px;
+        padding: 20px;
+        background: var(--secondary-bg);
+        border-bottom: 1px solid var(--border-color);
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+    
+    .theme-tab {
+        padding: 12px 24px;
+        background: var(--card-bg);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        color: var(--text-secondary);
+        cursor: pointer;
+        transition: all 0.3s ease;
+        font-weight: 500;
+    }
+    
+    .theme-tab:hover {
+        border-color: var(--accent-color);
+        color: var(--accent-color);
+    }
+    
+    .theme-tab.active {
+        background: var(--accent-color);
+        color: var(--primary-bg);
+        border-color: var(--accent-color);
+    }
+    
+    .theme-content {
+        display: none;
+        padding: 20px;
+    }
+    
+    .theme-content.active {
+        display: block;
+    }
+    
+    .theme-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 25px;
+    }
+    
+    .theme-card {
+        background: var(--card-bg);
+        border: 2px solid var(--border-color);
+        border-radius: 16px;
+        overflow: hidden;
+        transition: all 0.3s ease;
+    }
+    
+    .theme-card:hover {
+        transform: translateY(-5px);
+        border-color: var(--accent-secondary);
+        box-shadow: 0 10px 40px rgba(0, 204, 255, 0.2);
+    }
+    
+    .theme-card.current {
+        border-color: var(--accent-color);
+        box-shadow: 0 0 30px var(--glow-color);
+    }
+    
+    .theme-card.current::before {
+        content: '✓ ACTIVE';
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        background: var(--accent-color);
+        color: var(--primary-bg);
+        padding: 4px 10px;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: 700;
+    }
+    
+    .theme-card {
+        position: relative;
+    }
+    
+    .theme-preview {
+        height: 180px;
+        background: var(--secondary-bg);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-bottom: 1px solid var(--border-color);
+        overflow: hidden;
+    }
+    
+    .theme-preview img {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+    }
+    
+    .theme-preview .no-preview {
+        font-size: 4rem;
+        color: var(--text-secondary);
+    }
+    
+    .theme-preview .ascii-preview {
+        font-family: 'Fira Code', monospace;
+        font-size: 2rem;
+        color: var(--accent-color);
+    }
+    
+    .theme-info {
+        padding: 20px;
+    }
+    
+    .theme-name {
+        font-size: 1.3rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        margin-bottom: 8px;
+    }
+    
+    .theme-meta {
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+        margin-bottom: 15px;
+    }
+    
+    .theme-meta span {
+        margin-right: 15px;
+    }
+    
+    .theme-actions {
+        display: flex;
+        gap: 10px;
+    }
+    
+    .theme-actions button {
+        flex: 1;
+        padding: 10px 15px !important;
+        font-size: 12px !important;
+    }
+    
+    .btn-select {
+        background: var(--accent-color) !important;
+        color: var(--primary-bg) !important;
+    }
+    
+    /* Face Preview Section */
+    .face-section {
+        background: var(--card-bg);
+        border-radius: 12px;
+        padding: 25px;
+        margin: 20px;
+    }
+    
+    .face-section h3 {
+        color: var(--accent-color);
+        margin-bottom: 20px;
+        font-size: 1.2rem;
+    }
+    
+    .face-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+        gap: 15px;
+    }
+    
+    .face-item {
+        background: var(--secondary-bg);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 15px;
+        text-align: center;
+        transition: all 0.3s ease;
+    }
+    
+    .face-item:hover {
+        border-color: var(--accent-color);
+        transform: scale(1.05);
+    }
+    
+    .face-item .face {
+        font-size: 1.5rem;
+        margin-bottom: 8px;
+        font-family: 'Fira Code', monospace;
+    }
+    
+    .face-item .face-name {
+        font-size: 0.75rem;
+        color: var(--text-secondary);
+        text-transform: uppercase;
+    }
+    
+    /* Settings Panel */
+    .settings-panel {
+        background: var(--card-bg);
+        border-radius: 12px;
+        padding: 25px;
+        margin: 20px;
+    }
+    
+    .settings-panel h3 {
+        color: var(--accent-color);
+        margin-bottom: 20px;
+    }
+    
+    .setting-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 15px 0;
+        border-bottom: 1px solid var(--border-color);
+    }
+    
+    .setting-row:last-child {
+        border-bottom: none;
+    }
+    
+    .setting-label {
+        color: var(--text-primary);
+        font-weight: 500;
+    }
+    
+    .setting-description {
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+        margin-top: 4px;
+    }
+    
+    /* Upload Section */
+    .upload-zone {
+        border: 2px dashed var(--border-color);
+        border-radius: 12px;
+        padding: 40px;
+        text-align: center;
+        transition: all 0.3s ease;
+        cursor: pointer;
+        margin: 20px;
+    }
+    
+    .upload-zone:hover,
+    .upload-zone.dragover {
+        border-color: var(--accent-color);
+        background: rgba(0, 255, 136, 0.05);
+    }
+    
+    .upload-zone .icon {
+        font-size: 3rem;
+        margin-bottom: 15px;
+    }
+    
+    .upload-zone p {
+        color: var(--text-secondary);
+    }
+    
+    /* Loading Overlay */
+    .loading-overlay {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(10, 10, 15, 0.9);
+        z-index: 9999;
+        justify-content: center;
+        align-items: center;
+        flex-direction: column;
+    }
+    
+    .loading-overlay.active {
+        display: flex;
+    }
+    
+    .loading-overlay .spinner {
+        width: 60px;
+        height: 60px;
+        border-width: 4px;
+        margin-bottom: 20px;
+    }
+    
+    .loading-overlay p {
+        color: var(--accent-color);
+        font-size: 1.2rem;
+    }
+    
+    /* Notification Toast */
+    .toast {
+        position: fixed;
+        bottom: 100px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: var(--card-bg);
+        border: 1px solid var(--accent-color);
+        border-radius: 8px;
+        padding: 15px 25px;
+        box-shadow: 0 4px 20px var(--shadow-color);
+        z-index: 10000;
+        display: none;
+    }
+    
+    .toast.success {
+        border-color: var(--accent-color);
+        color: var(--accent-color);
+    }
+    
+    .toast.error {
+        border-color: var(--accent-danger);
+        color: var(--accent-danger);
+    }
+</style>
+{% endblock %}
+
+{% block script %}
+$(function() {
+    var currentTheme = '{{ current_theme }}';
+    
+    // Tab switching
+    $('.theme-tab').click(function() {
+        var target = $(this).data('tab');
+        $('.theme-tab').removeClass('active');
+        $(this).addClass('active');
+        $('.theme-content').removeClass('active');
+        $('#' + target).addClass('active');
+    });
+    
+    // Theme selection
+    window.selectTheme = function(themeName) {
+        if (themeName === currentTheme) {
+            showToast('This theme is already active!', 'info');
+            return;
+        }
+        
+        if (!confirm('Switch to theme: ' + themeName + '?')) return;
+        
+        showLoading('Applying theme...');
+        
+        $.ajax({
+            url: '/plugins/themes/set?theme=' + encodeURIComponent(themeName),
+            method: 'GET',
+            success: function(response) {
+                hideLoading();
+                showToast('Theme applied successfully!', 'success');
+                setTimeout(function() {
+                    location.reload();
+                }, 1500);
+            },
+            error: function(xhr) {
+                hideLoading();
+                showToast('Failed to apply theme: ' + (xhr.responseJSON?.error || 'Unknown error'), 'error');
+            }
+        });
+    };
+    
+    // Preview theme
+    window.previewTheme = function(themeName) {
+        showLoading('Loading preview...');
+        $.ajax({
+            url: '/plugins/themes/preview/' + themeName,
+            method: 'GET',
+            success: function(response) {
+                hideLoading();
+                // Show preview modal
+                alert('Preview for: ' + themeName + '\n\nFaces: ' + JSON.stringify(response.faces, null, 2));
+            },
+            error: function() {
+                hideLoading();
+                showToast('Failed to load preview', 'error');
+            }
+        });
+    };
+    
+    // Reset to default
+    window.resetToDefault = function() {
+        if (!confirm('Reset to default ASCII faces?')) return;
+        selectTheme('default');
+    };
+    
+    // Upload handling
+    var uploadZone = $('.upload-zone');
+    var fileInput = $('#theme-file');
+    
+    uploadZone.click(function() {
+        fileInput.click();
+    });
+    
+    uploadZone.on('dragover', function(e) {
+        e.preventDefault();
+        $(this).addClass('dragover');
+    });
+    
+    uploadZone.on('dragleave', function() {
+        $(this).removeClass('dragover');
+    });
+    
+    uploadZone.on('drop', function(e) {
+        e.preventDefault();
+        $(this).removeClass('dragover');
+        var files = e.originalEvent.dataTransfer.files;
+        if (files.length) {
+            handleFileUpload(files[0]);
+        }
+    });
+    
+    fileInput.change(function() {
+        if (this.files.length) {
+            handleFileUpload(this.files[0]);
+        }
+    });
+    
+    function handleFileUpload(file) {
+        if (!file.name.endsWith('.zip')) {
+            showToast('Please upload a .zip file', 'error');
+            return;
+        }
+        
+        showLoading('Uploading theme...');
+        
+        var formData = new FormData();
+        formData.append('theme', file);
+        // CSRF not needed for JSON API
+        
+        $.ajax({
+            url: '/plugins/themes/upload',
+            method: 'GET',
+            data: formData,
+            processData: false,
+            contentType: false,
+            success: function(response) {
+                hideLoading();
+                showToast('Theme uploaded successfully!', 'success');
+                setTimeout(function() {
+                    location.reload();
+                }, 1500);
+            },
+            error: function(xhr) {
+                hideLoading();
+                showToast('Upload failed: ' + (xhr.responseJSON?.error || 'Unknown error'), 'error');
+            }
+        });
+    }
+    
+    // Utility functions
+    function showLoading(message) {
+        $('.loading-overlay p').text(message || 'Loading...');
+        $('.loading-overlay').addClass('active');
+    }
+    
+    function hideLoading() {
+        $('.loading-overlay').removeClass('active');
+    }
+    
+    function showToast(message, type) {
+        var toast = $('.toast');
+        toast.removeClass('success error').addClass(type || 'success');
+        toast.text(message);
+        toast.fadeIn();
+        setTimeout(function() {
+            toast.fadeOut();
+        }, 3000);
+    }
+});
+{% endblock %}
+
+{% block content %}
+<!-- Loading Overlay -->
+<div class="loading-overlay">
+    <div class="spinner"></div>
+    <p>Loading...</p>
+</div>
+
+<!-- Toast Notification -->
+<div class="toast"></div>
+
+<div class="theme-manager-header">
+    <h1>🎨 Theme Manager</h1>
+    <p>Customize your Pwnagotchi's appearance</p>
+</div>
+
+<div class="current-theme-info">
+    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 20px;">
+        <div>
+            <div class="label">Current Theme</div>
+            <div class="value">{{ current_theme or 'Default (ASCII)' }}</div>
+        </div>
+        <div>
+            <button onclick="resetToDefault()" class="button btn-warning">🔄 Reset to Default</button>
+        </div>
+    </div>
+</div>
+
+<div class="theme-tabs">
+    <div class="theme-tab active" data-tab="installed">📦 Installed Themes</div>
+    <div class="theme-tab" data-tab="faces">😀 Current Faces</div>
+    <div class="theme-tab" data-tab="upload">⬆️ Upload Theme</div>
+    <div class="theme-tab" data-tab="settings">⚙️ Settings</div>
+</div>
+
+<!-- Installed Themes Tab -->
+<div id="installed" class="theme-content active">
+    <div class="theme-grid">
+        <!-- Default Theme -->
+        <div class="theme-card {% if not current_theme or current_theme == 'default' %}current{% endif %}">
+            <div class="theme-preview">
+                <div class="ascii-preview">(◕‿‿◕)</div>
+            </div>
+            <div class="theme-info">
+                <div class="theme-name">Default (ASCII)</div>
+                <div class="theme-meta">
+                    <span>✨ Built-in</span>
+                    <span>📝 Text faces</span>
+                </div>
+                <div class="theme-actions">
+                    <button onclick="selectTheme('default')" class="button {% if not current_theme or current_theme == 'default' %}btn-select{% endif %}">
+                        {% if not current_theme or current_theme == 'default' %}✓ Active{% else %}Select{% endif %}
+                    </button>
+                </div>
+            </div>
+        </div>
+        
+        {% for theme in themes %}
+        <div class="theme-card {% if current_theme == theme.name %}current{% endif %}">
+            <div class="theme-preview">
+                {% if theme.preview %}
+                    <img src="{{ theme.preview }}" alt="{{ theme.name }}">
+                {% else %}
+                    <div class="no-preview">🎭</div>
+                {% endif %}
+            </div>
+            <div class="theme-info">
+                <div class="theme-name">{{ theme.name }}</div>
+                <div class="theme-meta">
+                    {% if theme.author %}<span>👤 {{ theme.author }}</span>{% endif %}
+                    {% if theme.version %}<span>v{{ theme.version }}</span>{% endif %}
+                </div>
+                <div class="theme-actions">
+                    <button onclick="selectTheme('{{ theme.name }}')" class="button {% if current_theme == theme.name %}btn-select{% endif %}">
+                        {% if current_theme == theme.name %}✓ Active{% else %}Select{% endif %}
+                    </button>
+                    <button onclick="previewTheme('{{ theme.name }}')" class="button">👁️</button>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- Current Faces Tab -->
+<div id="faces" class="theme-content">
+    <div class="face-section">
+        <h3>Current Face Set</h3>
+        <div class="face-grid">
+            {% for face_name, face_value in faces.items() %}
+            <div class="face-item">
+                {% if face_value is string and face_value.endswith('.png') %}
+                    <div class="face"><img src="{{ face_value }}" style="max-width: 60px; max-height: 40px;"></div>
+                {% else %}
+                    <div class="face">{{ face_value }}</div>
+                {% endif %}
+                <div class="face-name">{{ face_name }}</div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+<!-- Upload Theme Tab -->
+<div id="upload" class="theme-content">
+    <div class="upload-zone">
+        <div class="icon">📁</div>
+        <h3>Upload Theme Package</h3>
+        <p>Drag & drop a .zip file here or click to browse</p>
+        <p style="font-size: 0.85rem; margin-top: 10px;">Supports themes from PWNAGOTCHI-CUSTOM-FACES-MOD</p>
+        <input type="file" id="theme-file" accept=".zip" style="display: none;">
+    </div>
+    
+    <div class="settings-panel" style="margin-top: 20px;">
+        <h3>📋 Theme Package Format</h3>
+        <p style="color: var(--text-secondary); margin-bottom: 15px;">
+            Theme packages should contain the following structure:
+        </p>
+        <pre style="font-size: 0.85rem;">
+theme-name/
+├── config.toml       # Face definitions
+├── faces/            # Face images (optional)
+│   ├── HAPPY.png
+│   ├── SAD.png
+│   └── ...
+└── info.json         # Theme metadata (optional)
+        </pre>
+    </div>
+</div>
+
+<!-- Settings Tab -->
+<div id="settings" class="theme-content">
+    <div class="settings-panel">
+        <h3>⚙️ Theme Settings</h3>
+        
+        <div class="setting-row">
+            <div>
+                <div class="setting-label">Use PNG Faces</div>
+                <div class="setting-description">Enable image-based faces instead of ASCII</div>
+            </div>
+            <input type="checkbox" data-role="flipswitch" id="png-faces" 
+                   data-on-text="ON" data-off-text="OFF"
+                   {% if use_png %}checked{% endif %}>
+        </div>
+        
+        <div class="setting-row">
+            <div>
+                <div class="setting-label">Face Position X</div>
+                <div class="setting-description">Horizontal position of the face</div>
+            </div>
+            <input type="number" id="face-pos-x" value="{{ face_position_x or 0 }}" style="width: 80px;">
+        </div>
+        
+        <div class="setting-row">
+            <div>
+                <div class="setting-label">Face Position Y</div>
+                <div class="setting-description">Vertical position of the face</div>
+            </div>
+            <input type="number" id="face-pos-y" value="{{ face_position_y or 40 }}" style="width: 80px;">
+        </div>
+        
+        <div style="margin-top: 20px; text-align: center;">
+            <button onclick="saveSettings()" class="button">💾 Save Settings</button>
+        </div>
+    </div>
+</div>
+
+<script>
+function saveSettings() {
+    var settings = {
+        use_png: $('#png-faces').prop('checked'),
+        position_x: parseInt($('#face-pos-x').val()) || 0,
+        position_y: parseInt($('#face-pos-y').val()) || 40
+    };
+    
+    $.ajax({
+        url: '/plugins/themes/settings',
+        method: 'GET',
+        data: JSON.stringify(settings),
+        success: function() {
+            alert('Settings saved!');
+        },
+        error: function() {
+            alert('Failed to save settings');
+        }
+    });
+}
+</script>
+{% endblock %}

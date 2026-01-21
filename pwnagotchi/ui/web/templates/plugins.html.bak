@@ -1,0 +1,315 @@
+{% extends "base.html" %}
+{% set active_page = "plugins" %}
+
+{% block title %}
+Plugins | Pwnagotchi
+{% endblock %}
+
+{% block styles %}
+  {{ super() }}
+  <style>
+    .plugin-search {
+        padding: 20px;
+        background: var(--secondary-bg);
+        border-radius: 12px;
+        margin: 20px;
+    }
+    
+    .plugin-search input {
+        width: 100%;
+        max-width: 400px;
+    }
+    
+    .plugin-stats {
+        display: flex;
+        gap: 20px;
+        justify-content: center;
+        margin-bottom: 20px;
+        flex-wrap: wrap;
+    }
+    
+    .stat-item {
+        background: var(--card-bg);
+        padding: 15px 25px;
+        border-radius: 8px;
+        border: 1px solid var(--border-color);
+        text-align: center;
+    }
+    
+    .stat-item .value {
+        font-size: 1.5rem;
+        font-weight: 700;
+        color: var(--accent-color);
+    }
+    
+    .stat-item .label {
+        font-size: 0.85rem;
+        color: var(--text-secondary);
+        text-transform: uppercase;
+    }
+    
+    .theme-selector {
+        margin-top: 15px;
+        padding-top: 15px;
+        border-top: 1px solid var(--border-color);
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+    }
+    
+    .theme-selector label {
+        font-weight: 600;
+        color: var(--accent-color);
+    }
+    
+    .theme-dropdown {
+        flex: 1;
+        min-width: 200px;
+        padding: 10px 15px;
+        background: var(--secondary-bg);
+        border: 2px solid var(--border-color);
+        border-radius: 8px;
+        color: var(--text-color);
+        font-size: 1rem;
+        cursor: pointer;
+        transition: all 0.3s ease;
+    }
+    
+    .theme-dropdown:hover {
+        border-color: var(--accent-color);
+    }
+    
+    .theme-dropdown:focus {
+        outline: none;
+        border-color: var(--accent-color);
+        box-shadow: 0 0 0 3px rgba(0, 255, 136, 0.2);
+    }
+    
+    .theme-dropdown option {
+        background: var(--secondary-bg);
+        color: var(--text-color);
+        padding: 10px;
+    }
+  </style>
+{% endblock %}
+
+{% block script %}
+// All handlers use document.ready since jQuery Mobile pagecreate can be inconsistent
+$(document).ready(function() {
+    // Toggle handler using event delegation
+    $(document).on('click', '.toggle-switch', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        
+        var toggle = $(this);
+        var form = toggle.closest('form');
+        var pluginBox = toggle.closest('.plugins-box');
+        var pluginName = form.find('input[name=plugin]').val();
+        var csrfToken = form.find('input[name=csrf_token]').val();
+        var checkbox = toggle.find('input[type=checkbox]');
+        
+        var currentState = toggle.hasClass('active');
+        var newState = !currentState;
+        
+        var formData = 'plugin=' + encodeURIComponent(pluginName) + '&csrf_token=' + encodeURIComponent(csrfToken);
+        if (newState) {
+            formData += '&enabled=on';
+        }
+        
+        toggle.toggleClass('active', newState);
+        toggle.find('.toggle-label').text(newState ? 'ON' : 'OFF');
+        checkbox.prop('checked', newState);
+        pluginBox.css('opacity', '0.6');
+        
+        $.ajax({
+            type: 'POST',
+            url: '/plugins/toggle',
+            data: formData,
+            headers: { 'X-CSRFToken': csrfToken },
+            success: function(data) {
+                pluginBox.css('opacity', '1');
+                if (data.indexOf('failed') !== -1) {
+                    alert('Could not toggle plugin: ' + pluginName);
+                    toggle.toggleClass('active', !newState);
+                    toggle.find('.toggle-label').text(!newState ? 'ON' : 'OFF');
+                    checkbox.prop('checked', !newState);
+                } else {
+                    pluginBox.css('border-color', '#00ff88');
+                    setTimeout(function() { window.location.reload(); }, 800);
+                }
+            },
+            error: function(xhr, status, error) {
+                pluginBox.css('opacity', '1');
+                alert('Network error: ' + error);
+                toggle.toggleClass('active', !newState);
+                toggle.find('.toggle-label').text(!newState ? 'ON' : 'OFF');
+                checkbox.prop('checked', !newState);
+            }
+        });
+        return false;
+    });
+    
+    // Upgrade handler
+    $(document).on('click', 'input[name=upgrade]', function(e) {
+        e.preventDefault();
+        var button = $(this);
+        var form = button.closest('form');
+        var pluginBox = button.closest('.plugins-box');
+        
+        if (!confirm('Upgrade this plugin?')) return;
+        
+        button.val('Upgrading...');
+        button.prop('disabled', true);
+        
+        $.ajax({
+            type: 'POST',
+            url: form.attr('action'),
+            data: form.serialize(),
+            success: function() {
+                button.val('Done!');
+                setTimeout(function() { location.reload(); }, 1000);
+            },
+            error: function() {
+                button.val('Failed');
+                button.prop('disabled', false);
+                setTimeout(function() { button.val('Upgrade'); }, 2000);
+            }
+        });
+    });
+    
+    // Search filter
+    $('#plugin-search').on('input', function() {
+        var search = $(this).val().toLowerCase();
+        $('.plugins-box').each(function() {
+            var name = $(this).find('h4').text().toLowerCase();
+            var desc = $(this).find('.plugin-desc').text().toLowerCase();
+            $(this).toggle(name.indexOf(search) > -1 || desc.indexOf(search) > -1);
+        });
+    });
+    
+    // Theme selector - load themes and handle selection
+    var themeSelect = $('#theme-select');
+    if (themeSelect.length) {
+        $.get('/plugins/themes/list', function(data) {
+            themeSelect.empty();
+            themeSelect.append('<option value="default"' + (data.current === 'default' ? ' selected' : '') + '>Default (ASCII)</option>');
+            if (data.themes && data.themes.length) {
+                data.themes.forEach(function(theme) {
+                    var selected = (data.current === theme.name) ? ' selected' : '';
+                    themeSelect.append('<option value="' + theme.name + '"' + selected + '>' + theme.name + '</option>');
+                });
+            }
+        }).fail(function() {
+            themeSelect.append('<option disabled>Failed to load themes</option>');
+        });
+        
+        themeSelect.on('change', function() {
+            var themeName = $(this).val();
+            var csrfToken = $('input[name=csrf_token]').first().val();
+            console.log('Theme selection - CSRF token:', csrfToken ? 'Found (' + csrfToken.substring(0,10) + '...)' : 'NOT FOUND');
+            themeSelect.prop('disabled', true);
+            $.ajax({
+                url: '/plugins/themes/select',
+                method: 'POST',
+                contentType: 'application/x-www-form-urlencoded',
+                data: { theme: themeName, csrf_token: csrfToken },
+                headers: { 'X-CSRFToken': csrfToken },
+                success: function(data) {
+                    if (data.success) {
+                        themeSelect.css('border-color', '#00ff88');
+                    } else {
+                        themeSelect.prop('disabled', false);
+                        alert('Failed to apply theme: ' + (data.error || 'Unknown error'));
+                    }
+                },
+                error: function(xhr) {
+                    themeSelect.prop('disabled', false);
+                    console.log('Theme selection error:', xhr.status, xhr.statusText, xhr.responseText);
+                    alert('Failed to apply theme: ' + (xhr.responseJSON ? xhr.responseJSON.error : xhr.statusText));
+                }
+            });
+        });
+    }
+});
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>🔌 Plugins</h1>
+    <p>Manage your Pwnagotchi plugins</p>
+</div>
+
+<div class="plugin-search">
+    <div class="plugin-stats">
+        <div class="stat-item">
+            <div class="value">{{ loaded|length }}</div>
+            <div class="label">Active</div>
+        </div>
+        <div class="stat-item">
+            <div class="value">{{ database|length }}</div>
+            <div class="label">Available</div>
+        </div>
+    </div>
+    <input type="text" id="plugin-search" placeholder="🔍 Search plugins...">
+</div>
+
+<div id="container">
+    {% for name in database.keys() | sort %}
+        {% set is_active = name in loaded %}
+        {% set meta = plugin_metadata.get(name, {}) %}
+        {% set desc = meta.get('description') or meta.get('help') or 'No description available' %}
+        {% set author = meta.get('author') %}
+        {% set version = meta.get('version') %}
+        <div class="plugins-box {% if is_active %}active{% endif %}">
+            <div class="plugin-header">
+                <h4>
+                    {% if is_active and loaded[name].on_webhook is defined %}
+                        <a href="/plugins/{{name}}">{{ name }}</a>
+                    {% else %}
+                        {{ name }}
+                    {% endif %}
+                    {% if is_active %}
+                        <span class="status-dot active" title="Active">●</span>
+                    {% endif %}
+                </h4>
+                <p class="plugin-desc">{{ desc }}</p>
+                {% if author or version %}
+                <p class="plugin-meta">
+                    {% if author %}<span>👤 {{ author }}</span>{% endif %}
+                    {% if version %}<span>📦 v{{ version }}</span>{% endif %}
+                </p>
+                {% endif %}
+            </div>
+            
+            <form method="POST" action="/plugins/toggle" class="toggle-form">
+                <div class="toggle-switch {% if is_active %}active{% endif %}">
+                    <input type="checkbox" 
+                           name="enabled" 
+                           id="toggle-{{name}}" 
+                           {% if is_active %}checked{% endif %}>
+                    <span class="toggle-slider"></span>
+                    <span class="toggle-label">{{ 'ON' if is_active else 'OFF' }}</span>
+                </div>
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                <input type="hidden" name="plugin" value="{{ name }}"/>
+            </form>
+            
+            <form method="POST" action="/plugins/upgrade" class="upgrade-form">
+                <input type="submit" name="upgrade" value="⬆️ Upgrade" class="button upgrade-btn">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                <input type="hidden" name="plugin" value="{{ name }}"/>
+            </form>
+            
+            {% if name == 'themes' %}
+            <div class="theme-selector">
+                <label for="theme-select">🎨 Active Theme:</label>
+                <select id="theme-select" class="theme-dropdown">
+                    <option value="default">Default (ASCII)</option>
+                </select>
+            </div>
+            {% endif %}
+        </div>
+    {% endfor %}
+</div>
+{% endblock %}

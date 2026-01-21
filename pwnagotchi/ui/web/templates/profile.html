@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% set active_page = "profile" %}
+
+{% block title %}
+Profile | Pwnagotchi
+{% endblock %}
+
+{% block script %}
+$(function(){
+    $('#qrcode').kjua({
+        text: 'https://opwngrid.xyz/search/{{ fingerprint }}',
+        render: 'svg',
+        mode: 0,
+        size: 300,
+        fontname: 'sans',
+        fontcolor: '#000'
+    });
+    
+    // Copy fingerprint to clipboard
+    $('#copy-fingerprint').click(function() {
+        navigator.clipboard.writeText('{{ fingerprint }}').then(function() {
+            $('#copy-fingerprint').text('✅ Copied!');
+            setTimeout(function() {
+                $('#copy-fingerprint').text('📋 Copy');
+            }, 2000);
+        });
+    });
+});
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>👤 Profile</h1>
+    <p>Your Pwnagotchi identity</p>
+</div>
+
+<div style="padding: 20px;">
+    <div class="card" style="text-align: center;">
+        <div style="font-size: 4rem; margin-bottom: 15px;">🤖</div>
+        <h2 style="color: var(--accent-color); font-size: 2rem; margin-bottom: 5px;">{{ name }}</h2>
+        <p style="color: var(--text-secondary);">Pwnagotchi Unit</p>
+    </div>
+    
+    <div class="card">
+        <h3 style="color: var(--accent-color); margin-bottom: 15px;">🔑 Fingerprint</h3>
+        <div style="background: var(--secondary-bg); padding: 15px; border-radius: 8px; font-family: monospace; word-break: break-all; margin-bottom: 15px;">
+            <a href="https://opwngrid.xyz/search/{{ fingerprint }}" target="_blank" style="color: var(--accent-secondary);">{{ fingerprint }}</a>
+        </div>
+        <button id="copy-fingerprint" class="button" style="width: 100%;">📋 Copy</button>
+    </div>
+    
+    <div class="card" style="text-align: center;">
+        <h3 style="color: var(--accent-color); margin-bottom: 15px;">📱 QR Code</h3>
+        <p style="color: var(--text-secondary); margin-bottom: 15px;">Scan to view profile on PwnGrid</p>
+        <div id="qrcode" style="display: inline-block; padding: 20px; background: white; border-radius: 12px;"></div>
+    </div>
+    
+    <div class="card">
+        <h3 style="color: var(--accent-color); margin-bottom: 15px;">📊 Advertisement Data</h3>
+        <pre style="max-height: 300px; overflow: auto;"><code id="data">{{ data }}</code></pre>
+    </div>
+</div>
+{% endblock %}
