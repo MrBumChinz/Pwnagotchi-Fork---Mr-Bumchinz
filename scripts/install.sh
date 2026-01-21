@@ -101,12 +101,11 @@ log_info "Installing Python dependencies..."
 /home/pi/.pwn/bin/pip install -q pcapy scapy cryptography numpy crcmod 2>/dev/null || true
 log_success "Python dependencies installed"
 
-# Check for bettercap
+# Check for bettercap (optional, not blocking)
 if [ ! -f "/usr/local/bin/bettercap" ]; then
-    log_warn "bettercap not found. Installing..."
-    if ! curl -s https://www.bettercap.org/install | bash > /dev/null 2>&1; then
-        log_warn "bettercap installation may have failed - continuing anyway"
-    fi
+    log_warn "bettercap not found"
+    log_warn "To install bettercap (optional, 10+ min build):"
+    log_warn "  curl https://www.bettercap.org/install | sudo bash"
 fi
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
