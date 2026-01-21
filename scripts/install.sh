@@ -16,6 +16,22 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Parse flags
+INSTALL_BETTERCAP=0
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --install-bettercap)
+            INSTALL_BETTERCAP=1
+            log_info "Bettercap installation enabled (may take 10+ minutes)"
+            shift
+            ;;
+        *)
+            log_warn "Unknown option: $1"
+            shift
+            ;;
+    esac
+done
+
 REPO="MrBumChinz/Pwnagotchi-Fork---Mr-Bumchinz"
 INSTALL_DIR="/home/pi/.pwn/lib/python3.11/site-packages"
 BACKUP_DIR="/etc/pwnagotchi/backups"
@@ -101,11 +117,33 @@ log_info "Installing Python dependencies..."
 /home/pi/.pwn/bin/pip install -q pcapy scapy cryptography numpy crcmod 2>/dev/null || true
 log_success "Python dependencies installed"
 
-# Check for bettercap (optional, not blocking)
-if [ ! -f "/usr/local/bin/bettercap" ]; then
-    log_warn "bettercap not found"
-    log_warn "To install bettercap (optional, 10+ min build):"
-    log_warn "  curl https://www.bettercap.org/install | sudo bash"
+# Install bettercap if requested
+if [ "$INSTALL_BETTERCAP" -eq 1 ]; then
+    if [ -f "/usr/local/bin/bettercap" ]; then
+        log_success "bettercap already installed"
+    else
+        log_info "Installing bettercap (this may take 10+ minutes)..."
+        
+        # Try curl install first
+        if curl -s https://www.bettercap.org/install | bash > /tmp/bettercap_install.log 2>&1; then
+            log_success "bettercap installed successfully"
+        else
+            # Fallback: try curl again as backup
+            log_warn "First install attempt failed, trying backup method..."
+            if curl -s https://www.bettercap.org/install | sudo bash >> /tmp/bettercap_install.log 2>&1; then
+                log_success "bettercap installed via backup method"
+            else
+                log_error "bettercap installation failed. Check /tmp/bettercap_install.log"
+                log_warn "You can retry later: curl https://www.bettercap.org/install | sudo bash"
+            fi
+        fi
+    fi
+else
+    if [ ! -f "/usr/local/bin/bettercap" ]; then
+        log_warn "bettercap not installed"
+        log_info "To install bettercap later (10+ min): sudo bash -c 'curl https://www.bettercap.org/install | bash'"
+        log_info "Or install now: sudo $0 --install-bettercap"
+    fi
 fi
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -179,3 +217,4 @@ log_info "WebUI: http://$(hostname -I | awk '{print $1}'):8080"
 log_info "SSH: ssh pi@$(hostname -I | awk '{print $1}')"
 echo ""
 log_warn "Next: Edit $CONFIG_DIR/config.toml and customize display driver"
+log_info "To install bettercap: sudo $0 --install-bettercap"
