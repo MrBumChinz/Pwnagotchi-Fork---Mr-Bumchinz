@@ -1,35 +1,18 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
+# Compiled
 *.o
+*.so
+*.pyc
+__pycache__/
+*.exe
 
-# Distribution / packaging
-dist/
-build/
-*.egg-info/
-
-# Virtual environments
-venv/
-.venv/
+# Build
+obj/
+bin/
 
 # IDE
-.idea/
 .vscode/
+.idea/
 
-# Sensitive files - NEVER COMMIT
-config.toml
-id_rsa
-id_rsa.pub
-*.key
-*.pem
-api_key*
-secret*
-
-# Logs
-*.log
-
-# Archives
-*.tar.gz
-*.zip
+# OS
+.DS_Store
+Thumbs.db
