@@ -32,7 +32,6 @@
 #include "icons.h"
 #include "plugins.h"
 #include "themes.h"
-#include "license.h"
 
 /* Configuration */
 #define SOCKET_PATH         "/var/run/pwnaui.sock"
@@ -598,48 +597,6 @@ static int handle_command(const char *cmd, char *response, size_t resp_size) {
         return 0;
     }
     
-    /* LICENSE_STATUS - Get current license status */
-    if (strcmp(cmd_name, "LICENSE_STATUS") == 0) {
-        license_status_t status = license_get_status();
-        const char *serial = license_get_device_serial();
-        snprintf(response, resp_size, "OK status=%d msg=%s serial=%s\n",
-                 status, license_status_string(status), serial);
-        return 0;
-    }
-    
-    /* LICENSE_INSTALL base64_license - Install a new license */
-    if (strcmp(cmd_name, "LICENSE_INSTALL") == 0) {
-        const char *license_b64 = cmd + 16;  /* Skip "LICENSE_INSTALL " */
-        while (*license_b64 == ' ') license_b64++;
-        
-        /* Remove trailing whitespace */
-        char lic_buf[512];
-        strncpy(lic_buf, license_b64, sizeof(lic_buf) - 1);
-        lic_buf[sizeof(lic_buf) - 1] = '\0';
-        char *end = lic_buf + strlen(lic_buf) - 1;
-        while (end > lic_buf && (*end == '\n' || *end == '\r' || *end == ' ')) *end-- = '\0';
-        
-        license_status_t status = license_install(lic_buf);
-        if (status == LICENSE_VALID) {
-            snprintf(response, resp_size, "OK License installed successfully\n");
-            PWNAUI_LOG_INFO("License installed and validated");
-            /* Trigger UI update since display is now unlocked */
-            g_dirty = 1;
-        } else {
-            snprintf(response, resp_size, "ERR License installation failed: %s\n",
-                     license_status_string(status));
-            PWNAUI_LOG_WARN("License installation failed: %s", license_status_string(status));
-        }
-        return 0;
-    }
-    
-    /* GET_DEVICE_ID - Get device serial for activation */
-    if (strcmp(cmd_name, "GET_DEVICE_ID") == 0) {
-        const char *serial = license_get_device_serial();
-        snprintf(response, resp_size, "OK %s\n", serial);
-        return 0;
-    }
-    
     /* Unknown command */
     snprintf(response, resp_size, "ERR Unknown command: %s\n", cmd_name);
     return -1;
@@ -793,10 +750,8 @@ static void *display_thread_func(void *arg) {
         
         /* Now do the slow display update WITHOUT holding the mutex */
         /* This is where epd_wait_busy() blocks, but main thread is free */
-        if (license_is_valid()) {
-            display_partial_update(g_display_fb, 0, 0, 0, 0);
-            PWNAUI_LOG_DEBUG("Display updated");
-        }
+        display_partial_update(g_display_fb, 0, 0, 0, 0);
+        PWNAUI_LOG_DEBUG("Display updated");
     }
     
     PWNAUI_LOG_INFO("Display thread exiting");
@@ -1012,16 +967,6 @@ int main(int argc, char *argv[]) {
             }
         }
     }
-
-    /* Initialize license system */
-    PWNAUI_LOG_INFO("Checking license...");
-    license_status_t lic_status = license_init();
-    if (lic_status == LICENSE_VALID) {
-        PWNAUI_LOG_INFO("License valid - display unlocked");
-    } else {
-        PWNAUI_LOG_WARN("License status: %s - display locked", license_status_string(lic_status));
-        PWNAUI_LOG_INFO("Device ID: %s", license_get_device_serial());
-    }
     
     /* Initialize UI state */
     init_ui_state();
@@ -1040,12 +985,7 @@ int main(int argc, char *argv[]) {
     }
     
     /* Initial render */
-    if (license_is_valid()) {
-        renderer_render_ui(&g_ui_state, g_framebuffer);
-    } else {
-        /* Show locked screen */
-        license_render_locked_screen(g_framebuffer, disp_width, disp_height);
-    }
+    renderer_render_ui(&g_ui_state, g_framebuffer);
     display_update(g_framebuffer);  /* Full update on startup */
     g_dirty = 0;
     g_last_update_ms = get_time_ms();
@@ -1232,8 +1172,8 @@ int main(int argc, char *argv[]) {
             }
         }
         
-        /* Auto-render when dirty (rate limited) - only if licensed */
-        if (g_dirty && license_is_valid()) {
+        /* Auto-render when dirty (rate limited) */
+        if (g_dirty) {
             uint64_t now = get_time_ms();
             if (now - g_last_update_ms >= UPDATE_INTERVAL_MS) {
                 renderer_render_ui(&g_ui_state, g_framebuffer);

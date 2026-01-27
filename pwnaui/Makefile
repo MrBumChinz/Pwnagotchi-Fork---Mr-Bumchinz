@@ -24,7 +24,6 @@ SOURCES = $(SRCDIR)/pwnaui.c \
           $(SRCDIR)/gps.c \
           $(SRCDIR)/faces.c \
           $(SRCDIR)/themes.c \
-          $(SRCDIR)/license.c \
           $(SRCDIR)/lodepng.c
 
 # Test sources (modules without main())
