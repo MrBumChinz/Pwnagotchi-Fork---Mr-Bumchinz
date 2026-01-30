@@ -465,7 +465,7 @@ class PwnaUIView:
                 if self._config['ui'].get('cursor', True):
                     name = self._state.get('name')
                     self.set('name', name.rstrip('█').strip() if '█' in name else (name + ' █'))
-                self.update()
+                self.update(force=True)  # Force update to ensure uptime ticks every second
             except Exception as e:
                 logging.warning(f"Non-fatal error in UI refresh: {e}")
             time.sleep(delay)

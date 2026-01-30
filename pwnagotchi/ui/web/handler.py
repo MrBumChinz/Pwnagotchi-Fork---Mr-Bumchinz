@@ -104,6 +104,9 @@ class Handler:
                                methods=['GET', 'POST'], defaults={'subpath': None})
         self._app.add_url_rule('/plugins/<name>/<path:subpath>', 'plugins', plugins_with_auth, methods=['GET', 'POST'])
 
+        # themes (direct access to Theme Manager)
+        self._app.add_url_rule('/themes', 'themes', self.with_auth(self.themes))
+
     def _check_creds(self, u, p):
         # trying to be timing attack safe
         return secrets.compare_digest(u, self._config['username']) and \
@@ -231,6 +234,58 @@ class Handler:
         grid.mark_message(id, mark)
         return redirect("/inbox")
 
+    def themes(self):
+        """Serve the Theme Manager page"""
+        from pwnagotchi import config as pwnconfig
+        from pwnagotchi.ui import faces
+        import glob
+        
+        current_theme = pwnconfig.get('ui.theme', 'default')
+        current_face_theme = pwnconfig.get('ui.faces.theme', 'default')
+        
+        # Get current faces dict
+        current_faces = {}
+        try:
+            # Get all face attributes from faces module
+            for attr in dir(faces):
+                if attr.isupper() and not attr.startswith('_'):
+                    value = getattr(faces, attr, None)
+                    if value is not None:
+                        current_faces[attr] = value
+        except Exception as e:
+            logging.error(f"Error getting faces: {e}")
+            current_faces = {'LOOK_R': '( ⚆_⚆)', 'LOOK_L': '(☉_☉ )', 'HAPPY': '(◕‿◕)'}
+        
+        # Scan for available themes
+        themes_dir = '/etc/pwnagotchi/custom-faces'
+        available_themes = []
+        
+        try:
+            if os.path.isdir(themes_dir):
+                for entry in os.listdir(themes_dir):
+                    theme_path = os.path.join(themes_dir, entry)
+                    if os.path.isdir(theme_path):
+                        # Check if it has face files (*.png or *.toml)
+                        has_faces = any(
+                            glob.glob(os.path.join(theme_path, '*.png')) or
+                            glob.glob(os.path.join(theme_path, '*.toml'))
+                        )
+                        if has_faces:
+                            available_themes.append({
+                                'name': entry,
+                                'path': theme_path,
+                                'preview': f'/themes/preview/{entry}'
+                            })
+        except Exception as e:
+            logging.error(f"Error scanning themes: {e}")
+        
+        return render_template('themes.html',
+                              title=f'{pwnagotchi.name()} - Themes',
+                              current_theme=current_theme,
+                              current_face_theme=current_face_theme,
+                              themes=available_themes,
+                              faces=current_faces)
+
     def plugins(self, name, subpath):
         if name is None:
             # Build metadata for all plugins in database
@@ -259,7 +314,8 @@ class Handler:
         if name in plugins.loaded and plugins.loaded[name] is not None and hasattr(plugins.loaded[name], 'on_webhook'):
             try:
                 return plugins.loaded[name].on_webhook(subpath, request)
-            except Exception:
+            except Exception as e:
+                logging.exception(f"[WebUI] Plugin webhook error ({name}): {e}")
                 abort(500)
         else:
             # Special handling for themes plugin - show helpful message

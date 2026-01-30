@@ -336,6 +336,12 @@ class Agent(Client, Automata, AsyncAdvertiser):
             except Exception as err:
                 logging.error("[agent:_fetch_stats] self.update_handshakes: %s" % repr(err))
 
+            # Trigger display refresh (CRITICAL for pwnaui uptime updates)
+            try:
+                self._view.update()
+            except Exception as err:
+                logging.debug("[agent:_fetch_stats] self._view.update: %s" % repr(err))
+
             time.sleep(5)
 
     async def _on_event(self, msg):

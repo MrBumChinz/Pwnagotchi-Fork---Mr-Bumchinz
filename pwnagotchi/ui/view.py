@@ -256,6 +256,31 @@ class View:
         global ROOT
         ROOT = self
         plugins.on('ui_setup', self)
+        
+        # Start refresh handler thread for 1-second uptime ticks
+        if config['ui'].get('fps', 0) > 0:
+            threading.Thread(target=self._refresh_handler, args=(),
+                           name="PwnaUI Handler", daemon=True).start()
+            logging.info(f"[view] Started refresh handler at {config['ui']['fps']} FPS")
+    
+    def _refresh_handler(self):
+        """Background thread that updates uptime every second"""
+        delay = 1.0 / self._config['ui']['fps']
+        while True:
+            try:
+                # Calculate live uptime
+                elapsed = int(time.time() - self._start_time)
+                days, remainder = divmod(elapsed, 86400)
+                hours, remainder = divmod(remainder, 3600)
+                mins, secs = divmod(remainder, 60)
+                uptime = '%02d:%02d:%02d:%02d' % (days, hours, mins, secs)
+                
+                # Send directly to daemon (bypass state change tracking)
+                _pwnaui.set_uptime(uptime)
+                _pwnaui.update()
+            except Exception as e:
+                logging.debug(f"[view] Refresh error: {e}")
+            time.sleep(delay)
     
     def on_agent(self, agent):
         self._agent = agent
@@ -369,7 +394,7 @@ class View:
         self.update()
     
     def on_manual_mode(self, last_session):
-        self.set('status', self._voice.on_manual_mode(last_session))
+        self.set('status', self._voice.on_last_session_data(last_session))
         self.set('face', faces.COOL)
         self.update()
     

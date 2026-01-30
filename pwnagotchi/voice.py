@@ -296,6 +296,9 @@ class Voice:
             self._("Here's your pathetic report:\n{status}").format(status=status),
             self._("Listen Morty, check this out:\n{status}").format(status=status)])
 
+    def on_manual_mode(self, last_session):
+        return self._('Switched to MANU mode. Hack the Planet!')
+
     def on_last_session_tweet(self, last_session):
         return random.choice([
             self._('I pwnt for {duration} and kicked {deauthed} clients! Made {associated} "friends" and got {handshakes} handshakes! #PwnagotchiRick #WubbaLubbaDubDub').format(

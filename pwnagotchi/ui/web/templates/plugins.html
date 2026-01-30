@@ -254,10 +254,10 @@ $(document).ready(function() {
 <div id="container">
     {% for name in database.keys() | sort %}
         {% set is_active = name in loaded %}
-        {% set meta = plugin_metadata.get(name, {}) %}
-        {% set desc = meta.get('description') or meta.get('help') or 'No description available' %}
-        {% set author = meta.get('author') %}
-        {% set version = meta.get('version') %}
+        {% set has_info = is_active and loaded[name].__description__ is defined %}
+        {% set desc = loaded[name].__description__ if has_info else 'Description available when plugin is loaded' %}
+        {% set author = loaded[name].__author__ if is_active and loaded[name].__author__ is defined else None %}
+        {% set version = loaded[name].__version__ if is_active and loaded[name].__version__ is defined else None %}
         <div class="plugins-box {% if is_active %}active{% endif %}">
             <div class="plugin-header">
                 <h4>
