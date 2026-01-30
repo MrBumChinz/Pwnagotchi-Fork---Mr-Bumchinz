@@ -35,7 +35,7 @@ dependencies = [
     "requests>=2.20.0",
     "flask>=1.0.0",
     "flask-cors>=3.0.8",
-    "pcapy>=1.0.0",
+    "pcapy-ng",
 ]
 
 [project.optional-dependencies]
