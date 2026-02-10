@@ -1,0 +1,9 @@
+[Unit]
+Description=Simple BT Agent
+After=bluetooth.service
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/simple-bt-agent
+Restart=always
+[Install]
+WantedBy=multi-user.target

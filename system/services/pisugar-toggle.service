@@ -1,0 +1,12 @@
+[Unit]
+Description=PiSugar 3 Mode Toggle Button Handler
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/pisugar_mode_toggle.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

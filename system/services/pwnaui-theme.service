@@ -1,0 +1,12 @@
+[Unit]
+Description=Set PwnaUI Default Theme
+After=pwnaui.service
+Wants=pwnaui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pwnaui-set-theme
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

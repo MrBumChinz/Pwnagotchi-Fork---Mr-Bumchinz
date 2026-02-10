@@ -1,0 +1,20 @@
+set wifi.interface wlan0mon
+set wifi.handshakes.aggregate false
+set wifi.handshakes.file /home/pi/handshakes
+set events.stream.output /etc/pwnagotchi/log/bettercap-events.log
+set api.rest.username pwnagotchi
+set api.rest.password pwnagotchi
+set api.rest.address 127.0.0.1
+set api.rest.port 8081
+set api.rest.websocket true
+api.rest on
+wifi.recon on
+
+# GPS via PwnHub Bluetooth GPS Receiver (virtual serial from pwnaui)
+set gps.device /dev/ttyUSB0
+set gps.baudrate 19200
+gps on
+
+# Reduce TTL for faster serialization (120s vs default 300s)
+set wifi.ap.ttl 120
+set wifi.sta.ttl 120

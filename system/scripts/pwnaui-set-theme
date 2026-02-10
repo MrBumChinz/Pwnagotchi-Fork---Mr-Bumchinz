@@ -1,0 +1,33 @@
+#!/bin/bash
+# pwnaui-set-theme - Set theme on pwnaui daemon startup
+# Waits for socket and applies configured theme
+
+# Wait for pwnaui socket to be ready
+for i in {1..30}; do
+    if [ -S /var/run/pwnaui.sock ]; then
+        # Try multiple config locations for theme
+        THEME=$(python3 -c "
+import toml
+cfg = toml.load('/etc/pwnagotchi/config.toml')
+# Check pwnaui_themes plugin config first (preferred)
+theme = cfg.get('main',{}).get('plugins',{}).get('pwnaui_themes',{}).get('theme')
+if not theme:
+    # Fallback to ui.faces.theme
+    theme = cfg.get('ui',{}).get('faces',{}).get('theme')
+if theme:
+    print(theme)
+" 2>/dev/null)
+
+        if [ -n "$THEME" ] && [ "$THEME" != "ascii" ] && [ "$THEME" != "default" ]; then
+            RESULT=$(echo "SET_THEME $THEME" | nc -U /var/run/pwnaui.sock 2>&1)
+            logger "pwnaui-set-theme: Set theme to $THEME -> $RESULT"
+            echo "Theme set to: $THEME"
+        else
+            logger "pwnaui-set-theme: No theme configured or using default"
+        fi
+        exit 0
+    fi
+    sleep 1
+done
+logger "pwnaui-set-theme: Timeout waiting for socket"
+exit 1

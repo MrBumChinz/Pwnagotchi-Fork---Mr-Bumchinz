@@ -1,0 +1,11 @@
+[Unit]
+Description=PiSugar 3 Mode Toggle Button
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/mode_toggle.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target

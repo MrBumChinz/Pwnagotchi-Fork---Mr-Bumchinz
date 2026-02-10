@@ -1,0 +1,10 @@
+#!/bin/bash
+# Simple agent - just keeps BT discoverable and pairable
+while true; do
+    bluetoothctl power on 2>/dev/null
+    bluetoothctl discoverable on 2>/dev/null
+    bluetoothctl pairable on 2>/dev/null
+    bluetoothctl agent NoInputNoOutput 2>/dev/null
+    bluetoothctl default-agent 2>/dev/null
+    sleep 30
+done

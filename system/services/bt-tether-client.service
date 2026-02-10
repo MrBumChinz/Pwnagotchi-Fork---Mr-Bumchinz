@@ -1,0 +1,13 @@
+[Unit]
+Description=Auto-connect to Phone BT Tethering
+After=bluetooth.service bt-pairing.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bt-auto-connect.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
