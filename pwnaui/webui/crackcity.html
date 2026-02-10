@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crack City - PwnaUI</title>
+<link rel="stylesheet" href="/assets/leaflet.css"/>
+<script src="/assets/leaflet.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Courier New',monospace;background:#1a1a2e;color:#0f0}
+#sidebar{position:fixed;left:0;top:0;bottom:0;width:320px;background:#16213e;
+ padding:15px;overflow-y:auto;z-index:1000;border-right:2px solid #0f3460}
+#map-container{position:fixed;left:320px;top:0;right:0;bottom:0}
+#map{width:100%;height:100%}
+h1{color:#e94560;font-size:18px;margin:0 0 8px;text-shadow:0 0 10px rgba(233,69,96,0.5)}
+.back{color:#e94560;text-decoration:none;font-size:13px;display:block;margin-bottom:10px}
+.back:hover{text-decoration:underline}
+.stats{background:#0f3460;padding:10px;border-radius:6px;margin:8px 0;font-size:13px}
+.stats .row{display:flex;justify-content:space-between;margin:3px 0}
+.stats .val{color:#0f0;font-weight:bold}
+hr{border:0;border-top:1px solid #333;margin:10px 0}
+.tabs{display:flex;gap:4px;margin:8px 0}
+.tab{flex:1;padding:6px;text-align:center;background:#0f3460;border:1px solid #333;
+ color:#888;cursor:pointer;font-size:11px;border-radius:4px}
+.tab.active{background:#e94560;color:#fff;border-color:#e94560}
+.net{background:#0f3460;padding:8px;margin:5px 0;border-radius:4px;cursor:pointer;
+ font-size:12px;transition:background 0.2s}
+.net:hover{background:#1a4a8a}
+.net.cracked{border-left:3px solid #0f0}
+.net.uncracked{border-left:3px solid #e94560}
+.net .ssid{font-weight:bold;color:#fff;font-size:13px}
+.net .pwd{color:#0f0;margin:2px 0}
+.net .info{color:#888;font-size:10px}
+.qr-box{background:#fff;padding:8px;display:inline-block;border-radius:4px;margin:4px 0}
+.attack{background:#1a1a2e;padding:6px 8px;margin:3px 0;border-radius:3px;font-size:11px;
+ border-left:2px solid #0f3460}
+.attack .type{color:#e94560;font-weight:bold}
+.attack .time{color:#555;float:right}
+.pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+@media(max-width:768px){
+ #sidebar{position:relative;width:100%;height:auto;max-height:40vh}
+ #map-container{position:relative;left:0;height:60vh}
+}
+</style>
+</head><body>
+<div id="sidebar">
+ <a class="back" href="/">&larr; Back to PwnaUI</a>
+ <h1>&#127961; CRACK CITY</h1>
+ <div class="stats" id="stats">Loading...</div>
+ <div class="tabs">
+  <div class="tab active" id="tab-nets" onclick="showTab('nets')">Networks</div>
+  <div class="tab" id="tab-attacks" onclick="showTab('attacks')">Attack Log</div>
+ </div>
+ <hr>
+ <div id="panel-nets"></div>
+ <div id="panel-attacks" style="display:none"></div>
+</div>
+<div id="map-container"><div id="map"></div></div>
+
+<script>
+var map,curMarker,netMarkers=[],qrLib=false;
+
+/* Try loading QR library from CDN */
+(function(){
+ var s=document.createElement('script');
+ s.src='/assets/qrcode.min.js';
+ s.onload=function(){qrLib=true};
+ s.onerror=function(){console.log('QR lib unavailable, using text fallback')};
+ document.head.appendChild(s);
+})();
+
+function initMap(){
+ map=L.map('map').setView([-32.0,115.8],13);
+ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+  attribution:'&copy; OpenStreetMap',maxZoom:19
+ }).addTo(map);
+}
+
+function makeIcon(color,size){
+ return L.divIcon({className:'',iconSize:[size,size],iconAnchor:[size/2,size/2],
+  html:'<div style="background:'+color+';width:'+size+'px;height:'+size+
+  'px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 6px '+color+'"></div>'});
+}
+
+function makeQR(text){
+ if(qrLib && typeof qrcode==='function'){
+  try{var q=qrcode(0,'M');q.addData(text);q.make();
+   return '<div class="qr-box">'+q.createSvgTag(3)+'</div>';}catch(e){}
+ }
+ return '<div class="qr-box" style="font-size:9px;color:#000;word-break:break-all;max-width:200px">'+
+  text.replace(/</g,'&lt;')+'</div>';
+}
+
+function showTab(t){
+ document.getElementById('tab-nets').className='tab'+(t==='nets'?' active':'');
+ document.getElementById('tab-attacks').className='tab'+(t==='attacks'?' active':'');
+ document.getElementById('panel-nets').style.display=t==='nets'?'':'none';
+ document.getElementById('panel-attacks').style.display=t==='attacks'?'':'none';
+ if(t==='attacks') loadAttacks();
+}
+
+function flyTo(lat,lon){map.flyTo([lat,lon],17)}
+
+function timeAgo(ts){
+ var d=Math.floor(Date.now()/1000)-ts;
+ if(d<60) return d+'s ago';
+ if(d<3600) return Math.floor(d/60)+'m ago';
+ if(d<86400) return Math.floor(d/3600)+'h ago';
+ return Math.floor(d/86400)+'d ago';
+}
+
+function loadCrackCity(){
+ fetch('/api/crackcity').then(function(r){return r.json()}).then(function(data){
+  var s=data.stats||{};
+  document.getElementById('stats').innerHTML=
+   '<div class="row"><span>Total handshakes</span><span class="val">'+
+   (s.total||0)+'</span></div>'+
+   '<div class="row"><span>With GPS</span><span class="val">'+
+   (s.with_gps||0)+'</span></div>'+
+   '<div class="row"><span>Cracked</span><span class="val" style="color:'
+   +(s.cracked>0?'#0f0':'#e94560')+'">'+
+   (s.cracked||0)+'</span></div>';
+
+  /* Current GPS position */
+  var g=data.current_gps;
+  if(g&&g.has_fix&&g.lat!==0){
+   if(curMarker) map.removeLayer(curMarker);
+   curMarker=L.marker([g.lat,g.lon],{icon:makeIcon('#00aaff',18)})
+    .addTo(map).bindPopup('<b>&#128205; Current Position</b>');
+   if(!window._mapCentered){map.setView([g.lat,g.lon],15);window._mapCentered=true}
+  }
+
+  /* Clear old markers */
+  netMarkers.forEach(function(m){map.removeLayer(m)});
+  netMarkers=[];
+
+  var html='';
+  var nets=data.networks||[];
+  /* Sort: cracked first, then by SSID */
+  nets.sort(function(a,b){
+   if(a.cracked!==b.cracked) return a.cracked?-1:1;
+   return a.ssid.localeCompare(b.ssid);
+  });
+
+  /* Render uncracked first, then cracked (so green dots are on top) */
+  nets.sort(function(a,b){
+   if(a.cracked!==b.cracked) return a.cracked?1:-1;
+   return a.ssid.localeCompare(b.ssid);
+  });
+  nets.forEach(function(n){
+   var cls=n.cracked?'cracked':'uncracked';
+   var icon=n.cracked?'&#128275;':'&#128274;';
+   var pwd=n.cracked?n.password:'???';
+   var wifiStr='WIFI:S:'+n.ssid+';T:WPA;P:'+(n.password||'')+';;';
+   var hasGps=n.has_gps&&n.lat!==0&&n.lon!==0;
+
+   html+='<div class="net '+cls+'"'+
+    (hasGps?' onclick="flyTo('+n.lat+','+n.lon+')"':'')+'>'+
+    '<div class="ssid">'+icon+' '+n.ssid+'</div>'+
+    '<div class="pwd">PWD: '+pwd+'</div>'+
+    '<div class="info">'+n.bssid+(hasGps?' | GPS':'')+'</div></div>';
+
+   if(hasGps){
+    var popup='<b>'+n.ssid+'</b><br>BSSID: '+n.bssid+'<br>'+
+     (n.cracked?'<span style="color:green">&#128275; '+n.password+'</span><br>'+
+      makeQR(wifiStr):
+      '<span style="color:red">&#128274; Not cracked</span>');
+    var m=L.marker([n.lat,n.lon],{icon:makeIcon(n.cracked?'#00ff00':'#e94560',n.cracked?18:10),zIndexOffset:n.cracked?1000:0})
+     .addTo(map).bindPopup(popup,{maxWidth:300});
+    netMarkers.push(m);
+   }
+  });
+  document.getElementById('panel-nets').innerHTML=html||
+   '<div style="color:#888;padding:20px">No networks found</div>';
+ }).catch(function(e){
+  document.getElementById('stats').innerHTML=
+   '<div style="color:red">Error: '+e+'</div>';
+ });
+}
+
+function loadAttacks(){
+ fetch('/api/attacks').then(function(r){return r.json()}).then(function(data){
+  var html='<div style="color:#888;font-size:11px;margin-bottom:8px">Total attacks: '+
+   (data.total||0)+'</div>';
+  var entries=data.entries||[];
+  /* Show newest first */
+  for(var i=entries.length-1;i>=0&&i>=entries.length-100;i--){
+   var e=entries[i];
+   if(!e.ssid&&!e.bssid) continue;
+   html+='<div class="attack">'+
+    '<span class="type">['+e.type+']</span> '+e.ssid+' '+e.bssid+
+    ' ('+e.rssi+'dBm ch'+e.ch+') '+
+    '<span class="result" style="color:'+(e.result==='ok'?'#0f0':'#e94560')+'">'+
+    e.result+'</span>'+
+    '<span class="time">'+timeAgo(e.ts)+'</span></div>';
+  }
+  document.getElementById('panel-attacks').innerHTML=html||
+   '<div style="color:#888">No attacks logged yet</div>';
+ }).catch(function(e){
+  document.getElementById('panel-attacks').innerHTML=
+   '<div style="color:red">Error: '+e+'</div>';
+ });
+}
+
+initMap();
+loadCrackCity();
+setInterval(loadCrackCity,10000);
+</script>
+</body></html>

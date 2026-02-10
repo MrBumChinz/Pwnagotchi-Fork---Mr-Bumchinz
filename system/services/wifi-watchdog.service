@@ -1,0 +1,15 @@
+[Unit]
+Description=WiFi Watchdog - Auto-recover from BCM43430 firmware crashes
+After=bettercap.service pwnaui.service
+Wants=bettercap.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wifi_watchdog.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
