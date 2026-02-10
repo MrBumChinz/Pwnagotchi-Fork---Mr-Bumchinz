@@ -3,7 +3,7 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE
-LDFLAGS = -lm -lutil -lpthread
+LDFLAGS = -lm -lutil -lpthread -lsqlite3
 
 # Optional: libwebsockets for bettercap WebSocket client
 # Set HAVE_LIBWEBSOCKETS=1 to enable
@@ -34,8 +34,23 @@ SOURCES = $(SRCDIR)/pwnaui.c \
           $(SRCDIR)/themes.c \
           $(SRCDIR)/lodepng.c \
           $(SRCDIR)/cJSON.c \
-          $(SRCDIR)/bcap_ws.c
-
+          $(SRCDIR)/bcap_ws.c \
+          $(SRCDIR)/health_monitor.c \
+          $(SRCDIR)/thompson.c \
+          $(SRCDIR)/brain.c $(SRCDIR)/brain_attacks.c $(SRCDIR)/brain_handshake.c \
+          $(SRCDIR)/channel_bandit.c \
+          $(SRCDIR)/stealth.c \
+          $(SRCDIR)/wifi_recovery.c \
+          $(SRCDIR)/crack_manager.c \
+          $(SRCDIR)/pcap_check.c \
+          $(SRCDIR)/pcapng_gps.c \
+          $(SRCDIR)/hc22000.c \
+          $(SRCDIR)/attack_log.c \
+          $(SRCDIR)/pisugar.c \
+          $(SRCDIR)/webserver.c \
+          $(SRCDIR)/gps_refine.c \
+          $(SRCDIR)/ap_database.c \
+          $(SRCDIR)/hash_sync.c
 # Test sources (modules without main())
 TEST_MODULES = $(SRCDIR)/ipc.c \
                $(SRCDIR)/renderer.c \

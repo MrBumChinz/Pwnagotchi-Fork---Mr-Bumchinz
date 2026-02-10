@@ -187,7 +187,7 @@ int plugin_gps_init(gps_data_t *data) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(GPS_UDP_PORT);
-    inet_pton(AF_INET, bind_ip, &addr.sin_addr);
+    inet_pton(AF_INET, "0.0.0.0", &addr.sin_addr);
     
     if (bind(data->udp_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "GPS: Failed to bind to port %d: %s\n", GPS_UDP_PORT, strerror(errno));

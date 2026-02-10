@@ -231,6 +231,14 @@ int bcap_subscribe(bcap_ws_ctx_t *ctx, const char *stream);
  * @return 0 on success, -1 on error
  */
 int bcap_send_command(bcap_ws_ctx_t *ctx, const char *cmd);
+int bcap_poll_aps(bcap_ws_ctx_t *ctx);
+
+/**
+ * Check if a full REST API sync is needed.
+ * Returns true if initial sync not done or BCAP_SYNC_INTERVAL_S elapsed.
+ * Between syncs, AP/STA data is maintained via WebSocket events.
+ */
+bool bcap_needs_sync(bcap_ws_ctx_t *ctx);
 
 /**
  * Request AP list refresh
@@ -255,6 +263,7 @@ int bcap_get_ap_count(bcap_ws_ctx_t *ctx);
  * Get current station count
  */
 int bcap_get_sta_count(bcap_ws_ctx_t *ctx);
+int bcap_get_sta(bcap_ws_ctx_t *ctx, int index, bcap_sta_t *sta);
 
 /**
  * Get total handshakes captured

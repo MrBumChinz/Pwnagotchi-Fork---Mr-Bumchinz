@@ -51,7 +51,7 @@ static const layout_t g_layouts[] = {
     {
         .name = "waveshare2in13_v4",
         .width = 250, .height = 122,
-        .face_x = 2, .face_y = 35,
+        .face_x = 2, .face_y = 30,
         .name_x = 5, .name_y = 20,
         .channel_x = 2, .channel_y = 0,
         .aps_x = 35, .aps_y = 0,
@@ -544,7 +544,7 @@ void renderer_render_ui(ui_state_t *state, uint8_t *framebuffer) {
     renderer_draw_text(state, framebuffer, L->name_x, L->name_y, state->name, FONT_BOLD);
     
     /* Face - ALWAYS use PNG theme (no ASCII fallback) */
-    theme_render_face_by_string(framebuffer, g_display_width, g_display_height,
+    theme_render_face_animated(framebuffer, g_display_width, g_display_height,
                                 L->face_x, L->face_y, state->face, state->invert);
     
     /* Status text (right side of face) - with word wrapping */
@@ -587,8 +587,8 @@ void renderer_render_ui(ui_state_t *state, uint8_t *framebuffer) {
     
     /* Bottom row: PWDS:0 FHS:0 PHS:0 TAPS:0 Auto/Manual */
     char bottom_stats[64];
-    snprintf(bottom_stats, sizeof(bottom_stats), "PWDS:%d FHS:%d PHS:%d TAPS:%d",
-             state->pwds, state->fhs, state->phs, state->taps);
+    snprintf(bottom_stats, sizeof(bottom_stats), "PWDS:%d FHS:%d PHS:%d TCAPS:%d",
+             state->pwds, state->fhs, state->phs, state->tcaps);
     renderer_draw_text(state, framebuffer, L->shakes_x, L->shakes_y, bottom_stats, FONT_BOLD);
     
     /* Mode: "Auto Mode" or "Manual Mode" - RIGHT ALIGNED with 2px buffer from edge */
@@ -671,7 +671,8 @@ void renderer_render_ui(ui_state_t *state, uint8_t *framebuffer) {
         renderer_draw_text(state, framebuffer, right_x, right_y, buf, FONT_SMALL);
         
         /* === MACRO ICONS: Just left of memtemp === */
-        /* Calculate average macro percentage (0-100) */
+        /* Calculate combined macro percentage (0-100) as hunger indicator */
+        /* 3 icons = well-fed (>=67%), 2 icons = okay (>=34%), 1 icon = hungry (>=10%) */
         /* Each macro is 0-50, total max is 150, so percentage = (total / 150) * 100 */
         int total_macros = state->pwnhub_protein + state->pwnhub_fat + state->pwnhub_carbs;
         int macro_percent = (total_macros * 100) / 150;  /* Max 50+50+50 = 150 */

@@ -16,38 +16,65 @@
 #define FACE_MAX_WIDTH  128
 #define FACE_MAX_HEIGHT 64
 
-/* 
- * Face states - matches Pwnagotchi's face states
- * These map to PNG filenames: HAPPY.png, SAD.png, etc.
+/*
+ * Face states - matches available PNG files
+ * Static expressions + animation frames
  */
 typedef enum {
-    FACE_LOOK_R = 0,
-    FACE_LOOK_L,
-    FACE_LOOK_R_HAPPY,
-    FACE_LOOK_L_HAPPY,
-    FACE_SLEEP,
-    FACE_SLEEP2,
-    FACE_AWAKE,
-    FACE_BORED,
-    FACE_INTENSE,
-    FACE_COOL,
-    FACE_HAPPY,
-    FACE_EXCITED,
-    FACE_GRATEFUL,
-    FACE_MOTIVATED,
-    FACE_DEMOTIVATED,
-    FACE_SMART,
-    FACE_LONELY,
+    /* === EXPRESSIONS (static) === */
+    FACE_HAPPY = 0,
     FACE_SAD,
     FACE_ANGRY,
+    FACE_EXCITED,
+    FACE_GRATEFUL,
+    FACE_LONELY,
+    FACE_COOL,
+    FACE_INTENSE,
+    FACE_SMART,
     FACE_FRIEND,
     FACE_BROKEN,
     FACE_DEBUG,
-    FACE_UPLOAD,
-    FACE_UPLOAD1,
-    FACE_UPLOAD2,
+    FACE_DEMOTIVATED,
+    
+    /* === LOOKING ANIMATIONS === */
+    FACE_LOOK_L,
+    FACE_LOOK_R,
+    FACE_LOOK_L_HAPPY,
+    FACE_LOOK_R_HAPPY,
+    
+    /* === SLEEP ANIMATIONS (cycle 1->2->3->4->3->2->1) === */
+    FACE_SLEEP1,
+    FACE_SLEEP2,
+    FACE_SLEEP3,
+    FACE_SLEEP4,
+    
+    /* === UPLOAD/DOWNLOAD ANIMATIONS (binary eyes) === */
+    FACE_UPLOAD_00,   /* Both eyes 0 */
+    FACE_UPLOAD_01,   /* Left 0, Right 1 */
+    FACE_UPLOAD_10,   /* Left 1, Right 0 */
+    FACE_UPLOAD_11,   /* Both eyes 1 */
+    
     FACE_STATE_COUNT
 } face_state_t;
+
+/* Animation types */
+typedef enum {
+    ANIM_NONE = 0,
+    ANIM_LOOK,        /* Alternate LOOK_L <-> LOOK_R */
+    ANIM_LOOK_HAPPY,  /* Alternate LOOK_L_HAPPY <-> LOOK_R_HAPPY */
+    ANIM_SLEEP,       /* Cycle SLEEP1->2->3->4->3->2->1 */
+    ANIM_UPLOAD,      /* Cycle 00->01->11->10 (binary counter) */
+    ANIM_DOWNLOAD     /* Cycle 11->10->00->01 (reverse binary) */
+} animation_type_t;
+
+/* Animation state */
+typedef struct {
+    animation_type_t type;
+    int frame;           /* Current frame index */
+    int direction;       /* 1 = forward, -1 = backward (for ping-pong) */
+    uint32_t last_tick;  /* Last update time (ms) */
+    int interval_ms;     /* Ms between frames */
+} animation_state_t;
 
 /* Face state name lookup (for filename matching) */
 extern const char *g_face_state_names[FACE_STATE_COUNT];
@@ -90,111 +117,52 @@ typedef struct {
 /* Global theme manager */
 extern theme_manager_t g_theme_mgr;
 
-/*
- * Initialize theme system
- * Returns 0 on success, -1 on error
- */
-int themes_init(const char *base_dir);
+/* Global animation state */
+extern animation_state_t g_anim_state;
 
 /*
- * Cleanup theme system
+ * Initialize theme system
  */
+int themes_init(const char *base_dir);
 void themes_cleanup(void);
 
 /*
- * Load a theme by name
- * Returns pointer to theme or NULL on error
+ * Theme loading/management
  */
 theme_t *theme_load(const char *name);
-
-/*
- * Unload a theme and free resources
- */
 void theme_unload(theme_t *theme);
-
-/*
- * Set the active theme
- * Returns 0 on success, -1 on error
- */
 int theme_set_active(const char *name);
-
-/*
- * Get list of available themes
- * Returns array of theme names (NULL terminated)
- * Caller must free the array (but not the strings)
- */
+const char *theme_get_active(void);
 char **theme_list_available(int *count);
-
-/*
- * Free theme list returned by theme_list_available
- */
 void theme_list_free(char **list);
 
 /*
- * Get face bitmap for current theme
- * Returns NULL if not loaded
+ * Face access
  */
 face_bitmap_t *theme_get_face(face_state_t state);
-
-/*
- * Map face string to face state
- * Returns FACE_HAPPY as default if not found
- */
 face_state_t theme_face_string_to_state(const char *face_str);
 
 /*
- * Render face from current theme to framebuffer
+ * Rendering
+ */
+/*
+ * Rendering
  */
 void theme_render_face(uint8_t *framebuffer, int fb_width, int fb_height,
                        int dest_x, int dest_y, face_state_t state, int invert);
-
-/*
- * Render face by string (convenience wrapper)
- */
 void theme_render_face_by_string(uint8_t *framebuffer, int fb_width, int fb_height,
                                  int dest_x, int dest_y, const char *face_str, int invert);
+void theme_render_face_animated(uint8_t *framebuffer, int fb_width, int fb_height,
+                                int dest_x, int dest_y, const char *face_str, int invert);
+face_state_t theme_name_to_state(const char *name);
 
 /*
- * Check if themes are enabled (vs fallback to text)
+ * Animation support
  */
-int themes_enabled(void);
-
-/*
- * Enable/disable theme rendering
- */
-void themes_set_enabled(int enabled);
-
-/*
- * Disable themes (convenience wrapper for themes_set_enabled(0))
- */
-void themes_disable(void);
-
-/*
- * Get count of available themes
- */
-int themes_count(void);
-
-/*
- * Get list of theme names (internal static array, do not free)
- * Returns pointer to array of theme name strings
- */
-const char **themes_list(void);
-
-/*
- * Get current active theme name
- * Returns NULL or empty string if no theme active
- */
-const char *theme_get_active(void);
-
-/*
- * Set theme scale factor (percentage, 20-200)
- * Default is 80 (80% of original size)
- */
-void theme_set_scale(int scale_percent);
-
-/*
- * Get current theme scale factor
- */
-int theme_get_scale(void);
+void animation_start(animation_type_t type, int interval_ms);
+void animation_stop(void);
+face_state_t animation_get_frame(void);
+int animation_is_active(void);
+void animation_tick(uint32_t now_ms);
 
 #endif /* PWNAUI_THEMES_H */

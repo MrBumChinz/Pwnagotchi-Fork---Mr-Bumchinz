@@ -21,32 +21,42 @@ static int g_themes_enabled = 0;
 
 /* Face state names - must match face_state_t enum order */
 const char *g_face_state_names[FACE_STATE_COUNT] = {
-    "LOOK_R",
-    "LOOK_L", 
-    "LOOK_R_HAPPY",
-    "LOOK_L_HAPPY",
-    "SLEEP",
-    "SLEEP2",
-    "AWAKE",
-    "BORED",
-    "INTENSE",
-    "COOL",
+    /* Expressions */
     "HAPPY",
-    "EXCITED",
-    "GRATEFUL",
-    "MOTIVATED",
-    "DEMOTIVATED",
-    "SMART",
-    "LONELY",
     "SAD",
     "ANGRY",
+    "EXCITED",
+    "GRATEFUL",
+    "LONELY",
+    "COOL",
+    "INTENSE",
+    "SMART",
     "FRIEND",
     "BROKEN",
     "DEBUG",
-    "UPLOAD",
-    "UPLOAD1",
-    "UPLOAD2"
+    "DEMOTIVATED",
+    
+    /* Looking animations */
+    "LOOK_L",
+    "LOOK_R",
+    "LOOK_L_HAPPY",
+    "LOOK_R_HAPPY",
+    
+    /* Sleep animations */
+    "SLEEP1",
+    "SLEEP2",
+    "SLEEP3",
+    "SLEEP4",
+    
+    /* Upload/Download animations (binary eyes) */
+    "00",
+    "01",
+    "10",
+    "11"
 };
+
+/* Global animation state */
+animation_state_t g_anim_state = {0};
 
 /* Face string to state mapping */
 typedef struct {
@@ -73,11 +83,15 @@ static const face_str_map_t g_face_str_map[] = {
     {"(⚆_⚆ )",    FACE_LOOK_L},
     {"( ◕‿◕)",    FACE_LOOK_R_HAPPY},
     {"(◕‿◕ )",    FACE_LOOK_L_HAPPY},
+    {"(._. )",     FACE_LOOK_L},
+    {"(o_o)",      FACE_LOOK_L},
+    {"( ._. )",    FACE_LOOK_R},
+    {"(._.)",      FACE_SAD},
     
     /* Sleeping */
-    {"(⇀‿‿↼)",    FACE_SLEEP},
-    {"(-_-) zzZ", FACE_SLEEP},
-    {"(－_－) zzZ", FACE_SLEEP},
+    {"(⇀‿‿↼)",    FACE_SLEEP1},
+    {"(-_-) zzZ", FACE_SLEEP1},
+    {"(－_－) zzZ", FACE_SLEEP1},
     {"(￣o￣) zzZ", FACE_SLEEP2},
     
     /* Sad/Negative */
@@ -93,9 +107,10 @@ static const face_str_map_t g_face_str_map[] = {
     {"(ಠ_ಠ)",     FACE_ANGRY},
     
     /* Bored */
-    {"(-_-)",     FACE_BORED},
-    {"(¬_¬)",     FACE_BORED},
-    {"(－‸ლ)",     FACE_BORED},
+    {"(-__-)",    FACE_DEMOTIVATED},
+    {"(-_-)",     FACE_DEMOTIVATED},
+    {"(¬_¬)",     FACE_DEMOTIVATED},
+    {"(－‸ლ)",     FACE_DEMOTIVATED},
     
     /* Intense */
     {"(ง'̀-'́)ง",   FACE_INTENSE},
@@ -113,8 +128,8 @@ static const face_str_map_t g_face_str_map[] = {
     {"(ب__ب)",    FACE_LONELY},
     
     /* Motivated */
-    {"(☼‿‿☼)",    FACE_MOTIVATED},
-    {"(•̀ᴗ•́)و",   FACE_MOTIVATED},
+    {"(☼‿‿☼)",    FACE_EXCITED},
+    {"(•̀ᴗ•́)و",   FACE_EXCITED},
     
     /* Demotivated */
     {"(≖__≖)",    FACE_DEMOTIVATED},
@@ -129,29 +144,29 @@ static const face_str_map_t g_face_str_map[] = {
     {"(#__#)",    FACE_DEBUG},
     
     /* Upload */
-    {"(1__0)",    FACE_UPLOAD},
-    {"(1__1)",    FACE_UPLOAD1},
-    {"(0__1)",    FACE_UPLOAD2},
+    {"(1__0)",    FACE_UPLOAD_11},
+    {"(1__1)",    FACE_UPLOAD_01},
+    {"(0__1)",    FACE_UPLOAD_10},
     
     /* Awake */
-    {"(◕◡◕)",     FACE_AWAKE},
-    {"(•‿•)",     FACE_AWAKE},
+    {"(◕◡◕)",     FACE_HAPPY},
+    {"(•‿•)",     FACE_HAPPY},
     
     /* Plain state names (for SET_FACE STATENAME commands) */
     {"LOOK_R",       FACE_LOOK_R},
     {"LOOK_L",       FACE_LOOK_L},
     {"LOOK_R_HAPPY", FACE_LOOK_R_HAPPY},
     {"LOOK_L_HAPPY", FACE_LOOK_L_HAPPY},
-    {"SLEEP",        FACE_SLEEP},
+    {"SLEEP",        FACE_SLEEP1},
     {"SLEEP2",       FACE_SLEEP2},
-    {"AWAKE",        FACE_AWAKE},
-    {"BORED",        FACE_BORED},
+    {"AWAKE",        FACE_HAPPY},
+    {"BORED",        FACE_DEMOTIVATED},
     {"INTENSE",      FACE_INTENSE},
     {"COOL",         FACE_COOL},
     {"HAPPY",        FACE_HAPPY},
     {"EXCITED",      FACE_EXCITED},
     {"GRATEFUL",     FACE_GRATEFUL},
-    {"MOTIVATED",    FACE_MOTIVATED},
+    {"MOTIVATED",    FACE_EXCITED},
     {"DEMOTIVATED",  FACE_DEMOTIVATED},
     {"SMART",        FACE_SMART},
     {"LONELY",       FACE_LONELY},
@@ -160,9 +175,9 @@ static const face_str_map_t g_face_str_map[] = {
     {"FRIEND",       FACE_FRIEND},
     {"BROKEN",       FACE_BROKEN},
     {"DEBUG",        FACE_DEBUG},
-    {"UPLOAD",       FACE_UPLOAD},
-    {"UPLOAD1",      FACE_UPLOAD1},
-    {"UPLOAD2",      FACE_UPLOAD2},
+    {"UPLOAD",       FACE_UPLOAD_11},
+    {"UPLOAD1",      FACE_UPLOAD_01},
+    {"UPLOAD2",      FACE_UPLOAD_10},
     
     {NULL, FACE_HAPPY}  /* Terminator + default */
 };
@@ -629,6 +644,113 @@ void theme_list_free(char **list) {
 /*
  * Get face bitmap for current theme
  */
+
+/* Get face PNG filename from face state (returns lowercase name like "awake") */
+
+/*
+ * Animation functions
+ */
+
+/* Sleep animation frames (ping-pong: 1->2->3->4->3->2->1) */
+static const face_state_t sleep_frames[] = {
+    FACE_SLEEP1, FACE_SLEEP2, FACE_SLEEP3, FACE_SLEEP4,
+    FACE_SLEEP3, FACE_SLEEP2
+};
+#define SLEEP_FRAME_COUNT 6
+
+/* Look animation frames */
+static const face_state_t look_frames[] = { FACE_LOOK_L, FACE_LOOK_R };
+static const face_state_t look_happy_frames[] = { FACE_LOOK_L_HAPPY, FACE_LOOK_R_HAPPY };
+#define LOOK_FRAME_COUNT 2
+
+/* Upload animation (binary counter: 00->01->10->11) */
+static const face_state_t upload_frames[] = {
+    FACE_UPLOAD_00, FACE_UPLOAD_01, FACE_UPLOAD_10, FACE_UPLOAD_11
+};
+#define UPLOAD_FRAME_COUNT 4
+
+/* Download animation (reverse: 11->10->01->00) */
+static const face_state_t download_frames[] = {
+    FACE_UPLOAD_11, FACE_UPLOAD_10, FACE_UPLOAD_01, FACE_UPLOAD_00
+};
+#define DOWNLOAD_FRAME_COUNT 4
+
+void animation_start(animation_type_t type, int interval_ms) {
+    g_anim_state.type = type;
+    g_anim_state.frame = 0;
+    g_anim_state.direction = 1;
+    g_anim_state.interval_ms = interval_ms > 0 ? interval_ms : 500;
+    g_anim_state.last_tick = 0;
+}
+
+void animation_stop(void) {
+    g_anim_state.type = ANIM_NONE;
+}
+
+int animation_is_active(void) {
+    return g_anim_state.type != ANIM_NONE;
+}
+
+void animation_tick(uint32_t now_ms) {
+    if (g_anim_state.type == ANIM_NONE) return;
+    
+    if (now_ms - g_anim_state.last_tick < (uint32_t)g_anim_state.interval_ms) return;
+    
+    g_anim_state.last_tick = now_ms;
+    
+    int max_frame = 0;
+    switch (g_anim_state.type) {
+        case ANIM_LOOK:
+        case ANIM_LOOK_HAPPY:
+            max_frame = LOOK_FRAME_COUNT;
+            break;
+        case ANIM_SLEEP:
+            max_frame = SLEEP_FRAME_COUNT;
+            break;
+        case ANIM_UPLOAD:
+        case ANIM_DOWNLOAD:
+            max_frame = UPLOAD_FRAME_COUNT;
+            break;
+        default:
+            return;
+    }
+    
+    g_anim_state.frame = (g_anim_state.frame + 1) % max_frame;
+}
+
+face_state_t animation_get_frame(void) {
+    switch (g_anim_state.type) {
+        case ANIM_LOOK:
+            return look_frames[g_anim_state.frame % LOOK_FRAME_COUNT];
+        case ANIM_LOOK_HAPPY:
+            return look_happy_frames[g_anim_state.frame % LOOK_FRAME_COUNT];
+        case ANIM_SLEEP:
+            return sleep_frames[g_anim_state.frame % SLEEP_FRAME_COUNT];
+        case ANIM_UPLOAD:
+            return upload_frames[g_anim_state.frame % UPLOAD_FRAME_COUNT];
+        case ANIM_DOWNLOAD:
+            return download_frames[g_anim_state.frame % DOWNLOAD_FRAME_COUNT];
+        default:
+            return FACE_HAPPY;
+    }
+}
+
+
+const char *theme_get_face_name(face_state_t state) {
+    if (state < 0 || state >= FACE_STATE_COUNT) {
+        return "awake";  /* Default */
+    }
+    /* g_face_state_names has uppercase like "AWAKE", but PNG files are lowercase */
+    static char lowercase_name[32];
+    const char *name = g_face_state_names[state];
+    int i;
+    for (i = 0; name[i] && i < 31; i++) {
+        lowercase_name[i] = name[i];  /* Keep uppercase - files are AWAKE.png etc */
+    }
+    lowercase_name[i] = '\0';
+    return lowercase_name;
+}
+
 face_bitmap_t *theme_get_face(face_state_t state) {
     if (!g_theme_mgr.current || state < 0 || state >= FACE_STATE_COUNT) {
         return NULL;
@@ -731,14 +853,9 @@ int theme_get_scale(void) {
 }
 
 /*
- * Target face size for e-ink display
- * Faces larger than this will be scaled down
- */
-#define TARGET_FACE_SIZE 64
-
-/*
  * Render face from current theme to framebuffer
- * With automatic scaling for oversized faces
+ * Renders at NATIVE size - no forced scaling
+ * Each theme displays at whatever size its face PNGs are
  */
 void theme_render_face(uint8_t *framebuffer, int fb_width, int fb_height,
                        int dest_x, int dest_y, face_state_t state, int invert) {
@@ -747,50 +864,22 @@ void theme_render_face(uint8_t *framebuffer, int fb_width, int fb_height,
         return;  /* No face to render */
     }
     
-    /* Calculate scaling factor if face is too large */
-    int src_w = face->width;
-    int src_h = face->height;
-    int dst_w = src_w;
-    int dst_h = src_h;
+    /* Render at native size - no scaling */
+    int face_w = face->width;
+    int face_h = face->height;
     
-    /* Scale down if larger than target */
-    if (src_w > TARGET_FACE_SIZE || src_h > TARGET_FACE_SIZE) {
-        float scale = 1.0f;
-        if (src_w > src_h) {
-            scale = (float)TARGET_FACE_SIZE / src_w;
-        } else {
-            scale = (float)TARGET_FACE_SIZE / src_h;
-        }
-        dst_w = (int)(src_w * scale);
-        dst_h = (int)(src_h * scale);
-    }
-    
-    /* Debug log */
-    FILE *dbg = fopen("/tmp/theme_debug.log", "a");
-    if (dbg) {
-        fprintf(dbg, "RENDER: state=%d, pos=(%d,%d), fb=%dx%d, face=%dx%d -> %dx%d\n",
-                state, dest_x, dest_y, fb_width, fb_height, src_w, src_h, dst_w, dst_h);
-        fclose(dbg);
-    }
-    
-    /* Render with nearest-neighbor scaling for crisp e-ink output */
-    for (int y = 0; y < dst_h; y++) {
+    /* Blit face bitmap to framebuffer at native size */
+    for (int y = 0; y < face_h; y++) {
         int screen_y = dest_y + y;
         if (screen_y < 0 || screen_y >= fb_height) continue;
         
-        /* Map destination Y to source Y */
-        int src_y = (y * src_h) / dst_h;
-        
-        for (int x = 0; x < dst_w; x++) {
+        for (int x = 0; x < face_w; x++) {
             int screen_x = dest_x + x;
             if (screen_x < 0 || screen_x >= fb_width) continue;
             
-            /* Map destination X to source X */
-            int src_x = (x * src_w) / dst_w;
-            
             /* Get pixel from face bitmap */
-            int src_byte = src_y * face->stride + src_x / 8;
-            int src_bit = 7 - (src_x % 8);
+            int src_byte = y * face->stride + x / 8;
+            int src_bit = 7 - (x % 8);
             int pixel = (face->bitmap[src_byte] >> src_bit) & 1;
             
             /* Invert by default - PNG has 1=black, e-ink framebuffer needs 0=black */
@@ -879,4 +968,37 @@ const char *theme_get_active(void) {
         return g_theme_mgr.current->name;
     }
     return "";
+}
+
+/*
+ * Find face state by PNG name (e.g., " HAPPY\, \LOOK_L\, \SLEEP1\)
+ */
+face_state_t theme_name_to_state(const char *name) {
+ if (!name) return FACE_DEMOTIVATED;
+ 
+ for (int i = 0; i < FACE_STATE_COUNT; i++) {
+ if (strcasecmp(g_face_state_names[i], name) == 0) {
+ return (face_state_t)i;
+ }
+ }
+ return FACE_DEMOTIVATED;
+}
+
+/*
+ * Render face with animation override
+ * If animation is active, uses animation frame instead of face string lookup
+ */
+void theme_render_face_animated(uint8_t *framebuffer, int fb_width, int fb_height,
+ int dest_x, int dest_y, const char *face_str, int invert) {
+ face_state_t state;
+ 
+ /* Check if animation is active - if so, use animation frame */
+ if (animation_is_active()) {
+ state = animation_get_frame();
+ } else {
+ /* Fall back to string lookup */
+ state = theme_face_string_to_state(face_str);
+ }
+ 
+ theme_render_face(framebuffer, fb_width, fb_height, dest_x, dest_y, state, invert);
 }

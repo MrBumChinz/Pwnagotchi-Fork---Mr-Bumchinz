@@ -1,0 +1,23 @@
+# Build artifacts
+bin/
+obj/
+*.o
+*.d
+
+# Backup files
+*.bak
+*.orig
+*.old
+*~
+*.pre-split
+
+# Temp files
+tmpclaude-*
+*.tmp
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+*.pre-hs-split

@@ -49,6 +49,31 @@ static const char b64_table[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /* ==========================================================================
+ * Debug Logging Categories (delta-filtered)
+ * ========================================================================== */
+
+/* Log categories - enable/disable as needed for debugging */
+#define BCAP_LOG_POLL      0x01  /* Poll results (AP/STA counts) */
+#define BCAP_LOG_CONNECT   0x02  /* Connection state changes */
+#define BCAP_LOG_EVENTS    0x04  /* WebSocket events */
+#define BCAP_LOG_ERRORS    0x08  /* Errors only */
+#define BCAP_LOG_ALL       0xFF
+
+/* Current log level - change to filter what you want */
+static int bcap_log_level = BCAP_LOG_CONNECT | BCAP_LOG_ERRORS | BCAP_LOG_POLL;
+
+#define BCAP_LOG(cat, fmt, ...) do { \
+    if (bcap_log_level & (cat)) { \
+        fprintf(stderr, fmt, ##__VA_ARGS__); \
+    } \
+} while(0)
+
+/* Sync interval: how often (seconds) to do a full REST API reconciliation.
+ * Between syncs, AP/STA tracking is purely event-driven via WebSocket.
+ * This saves ~2.6s of bettercap serialization lock per brain cycle. */
+#define BCAP_SYNC_INTERVAL_S  60
+
+/* ==========================================================================
  * Internal Structures
  * ========================================================================== */
 
@@ -88,27 +113,53 @@ struct bcap_ws_ctx {
     bcap_sta_t stas[BCAP_MAX_STAS];
     int sta_count;
     int handshake_count;
-    
+
+    /* Sync timer: full REST sync every BCAP_SYNC_INTERVAL_S seconds */
+    time_t last_full_sync;      /* Timestamp of last successful bcap_poll_aps() */
+    bool initial_sync_done;     /* First REST poll completed? */
+
     /* Reconnection */
     time_t last_connect_attempt;
     int reconnect_count;
     int max_reconnect_attempts;
     int reconnect_delay_ms;
-    
+
     /* Heartbeat */
     time_t last_ping_sent;
     time_t last_pong_recv;
     bool awaiting_pong;
-    
+
     /* Background thread */
     pthread_t service_thread;
     volatile bool running;
     volatile bool thread_started;
 };
 
-/* ==========================================================================
- * Utility Functions
- * ========================================================================== */
+/* State name helper for logging */
+static const char* bcap_state_name(bcap_state_t state) __attribute__((unused));
+static const char* bcap_state_name(bcap_state_t state) {
+    switch (state) {
+        case BCAP_STATE_DISCONNECTED:  return "DISCONNECTED";
+        case BCAP_STATE_CONNECTING:    return "CONNECTING";
+        case BCAP_STATE_HANDSHAKE:     return "HANDSHAKE";
+        case BCAP_STATE_CONNECTED:     return "CONNECTED";
+        case BCAP_STATE_RECONNECTING:  return "RECONNECTING";
+        case BCAP_STATE_CLOSING:       return "CLOSING";
+        default:                       return "UNKNOWN";
+    }
+}
+
+/* Set state with delta logging - only logs on actual change */
+static void bcap_set_state(bcap_ws_ctx_t *ctx, bcap_state_t new_state) __attribute__((unused));
+static void bcap_set_state(bcap_ws_ctx_t *ctx, bcap_state_t new_state) {
+    if (!ctx) return;
+    bcap_state_t old_state = ctx->state;
+    if (old_state != new_state) {
+        ctx->state = new_state;
+        BCAP_LOG(BCAP_LOG_CONNECT, "[bcap:conn] %s -> %s\n",
+                 bcap_state_name(old_state), bcap_state_name(new_state));
+    }
+}
 
 void bcap_config_init(bcap_config_t *config) {
     if (!config) return;
@@ -585,11 +636,10 @@ static void process_json_message(bcap_ws_ctx_t *ctx, const char *json_str) {
     if (data && event.type != BCAP_EVT_NONE) {
         switch (event.type) {
             case BCAP_EVT_AP_NEW:
-            case BCAP_EVT_AP_LOST:
                 parse_ap_json(data, &event.data.ap);
                 
                 pthread_mutex_lock(&ctx->data_lock);
-                if (event.type == BCAP_EVT_AP_NEW && ctx->ap_count < BCAP_MAX_APS) {
+                if (ctx->ap_count < BCAP_MAX_APS) {
                     int found = -1;
                     for (int i = 0; i < ctx->ap_count; i++) {
                         if (memcmp(ctx->aps[i].bssid.addr, event.data.ap.bssid.addr, 6) == 0) {
@@ -598,6 +648,7 @@ static void process_json_message(bcap_ws_ctx_t *ctx, const char *json_str) {
                         }
                     }
                     if (found >= 0) {
+                        /* Update existing AP (preserves event-driven RSSI/channel) */
                         ctx->aps[found] = event.data.ap;
                     } else {
                         ctx->aps[ctx->ap_count++] = event.data.ap;
@@ -605,14 +656,53 @@ static void process_json_message(bcap_ws_ctx_t *ctx, const char *json_str) {
                 }
                 pthread_mutex_unlock(&ctx->data_lock);
                 break;
+
+            case BCAP_EVT_AP_LOST:
+                parse_ap_json(data, &event.data.ap);
+                
+                pthread_mutex_lock(&ctx->data_lock);
+                {
+                    /* Find and remove AP from array */
+                    int found = -1;
+                    for (int i = 0; i < ctx->ap_count; i++) {
+                        if (memcmp(ctx->aps[i].bssid.addr, event.data.ap.bssid.addr, 6) == 0) {
+                            found = i;
+                            break;
+                        }
+                    }
+                    if (found >= 0) {
+                        /* Shift remaining APs down to fill the gap */
+                        for (int i = found; i < ctx->ap_count - 1; i++) {
+                            ctx->aps[i] = ctx->aps[i + 1];
+                        }
+                        ctx->ap_count--;
+                        
+                        /* Also remove any clients that belonged to this AP */
+                        int w = 0;
+                        for (int r = 0; r < ctx->sta_count; r++) {
+                            if (memcmp(ctx->stas[r].ap_bssid.addr, event.data.ap.bssid.addr, 6) != 0) {
+                                if (w != r) ctx->stas[w] = ctx->stas[r];
+                                w++;
+                            }
+                        }
+                        ctx->sta_count = w;
+                        
+                        BCAP_LOG(BCAP_LOG_EVENTS, "[bcap:event] AP lost: %02x:%02x:%02x:%02x:%02x:%02x (now %d APs, %d STAs)\n",
+                                 event.data.ap.bssid.addr[0], event.data.ap.bssid.addr[1],
+                                 event.data.ap.bssid.addr[2], event.data.ap.bssid.addr[3],
+                                 event.data.ap.bssid.addr[4], event.data.ap.bssid.addr[5],
+                                 ctx->ap_count, ctx->sta_count);
+                    }
+                }
+                pthread_mutex_unlock(&ctx->data_lock);
+                break;
                 
             case BCAP_EVT_CLIENT_NEW:
-            case BCAP_EVT_CLIENT_LOST:
             case BCAP_EVT_CLIENT_PROBE:
                 parse_sta_json(data, &event.data.sta);
                 
                 pthread_mutex_lock(&ctx->data_lock);
-                if (event.type == BCAP_EVT_CLIENT_NEW && ctx->sta_count < BCAP_MAX_STAS) {
+                if (ctx->sta_count < BCAP_MAX_STAS) {
                     int found = -1;
                     for (int i = 0; i < ctx->sta_count; i++) {
                         if (memcmp(ctx->stas[i].mac.addr, event.data.sta.mac.addr, 6) == 0) {
@@ -624,6 +714,29 @@ static void process_json_message(bcap_ws_ctx_t *ctx, const char *json_str) {
                         ctx->stas[found] = event.data.sta;
                     } else {
                         ctx->stas[ctx->sta_count++] = event.data.sta;
+                    }
+                }
+                pthread_mutex_unlock(&ctx->data_lock);
+                break;
+
+            case BCAP_EVT_CLIENT_LOST:
+                parse_sta_json(data, &event.data.sta);
+                
+                pthread_mutex_lock(&ctx->data_lock);
+                {
+                    /* Find and remove client from array */
+                    int found = -1;
+                    for (int i = 0; i < ctx->sta_count; i++) {
+                        if (memcmp(ctx->stas[i].mac.addr, event.data.sta.mac.addr, 6) == 0) {
+                            found = i;
+                            break;
+                        }
+                    }
+                    if (found >= 0) {
+                        for (int i = found; i < ctx->sta_count - 1; i++) {
+                            ctx->stas[i] = ctx->stas[i + 1];
+                        }
+                        ctx->sta_count--;
                     }
                 }
                 pthread_mutex_unlock(&ctx->data_lock);
@@ -771,7 +884,8 @@ static int attempt_reconnect(bcap_ws_ctx_t *ctx) {
         return -1;
     }
     
-    if (ctx->reconnect_count >= ctx->max_reconnect_attempts) {
+    /* 0 means infinite retries */
+    if (ctx->max_reconnect_attempts > 0 && ctx->reconnect_count >= ctx->max_reconnect_attempts) {
         fprintf(stderr, "[bcap_ws] Max reconnection attempts reached\n");
         return -1;
     }
@@ -821,7 +935,7 @@ static int attempt_reconnect(bcap_ws_ctx_t *ctx) {
     }
     
     /* Re-subscribe to events */
-    bcap_subscribe(ctx, "wifi.events");
+    bcap_subscribe(ctx, "wifi.*");
     
     return 0;
 }
@@ -886,8 +1000,22 @@ static void* service_thread_func(void *arg) {
                 ctx->state = BCAP_STATE_DISCONNECTED;
                 pthread_mutex_unlock(&ctx->state_lock);
             }
+        } else if (state == BCAP_STATE_DISCONNECTED && ctx->config.auto_reconnect) {
+            /* Initial connect failed - try to reconnect */
+            printf("[bcap_ws] Attempting connection...\n");
+            pthread_mutex_lock(&ctx->state_lock);
+            ctx->state = BCAP_STATE_RECONNECTING;
+            pthread_mutex_unlock(&ctx->state_lock);
+            
+            if (attempt_reconnect(ctx) < 0) {
+                pthread_mutex_lock(&ctx->state_lock);
+                ctx->state = BCAP_STATE_DISCONNECTED;
+                pthread_mutex_unlock(&ctx->state_lock);
+                /* Wait before next attempt */
+                sleep(2);
+            }
         } else {
-            /* Not connected - sleep */
+            /* Not connected and not auto-reconnecting - sleep */
             usleep(100000);
         }
     }
@@ -929,6 +1057,10 @@ bcap_ws_ctx_t* bcap_create(const bcap_config_t *config) {
     ctx->state = BCAP_STATE_DISCONNECTED;
     ctx->max_reconnect_attempts = ctx->config.max_reconnect_attempts;
     ctx->reconnect_delay_ms = ctx->config.reconnect_delay_ms;
+    
+    /* Sync timer: force immediate first sync */
+    ctx->last_full_sync = 0;
+    ctx->initial_sync_done = false;
     
     return ctx;
 }
@@ -998,20 +1130,22 @@ int bcap_connect(bcap_ws_ctx_t *ctx) {
 int bcap_connect_async(bcap_ws_ctx_t *ctx) {
     if (!ctx) return -1;
     
-    /* Connect synchronously first */
-    if (bcap_connect(ctx) < 0) {
-        return -1;
-    }
+    /* Try to connect synchronously first */
+    int connected = (bcap_connect(ctx) == 0);
     
-    /* Start background thread */
+    /* ALWAYS start background thread for reconnection, even if initial connect fails */
     ctx->running = true;
     if (pthread_create(&ctx->service_thread, NULL, service_thread_func, ctx) != 0) {
-        bcap_disconnect(ctx);
+        if (connected) {
+            bcap_disconnect(ctx);
+        }
         return -1;
     }
     ctx->thread_started = true;
     
-    return 0;
+    /* Return success if connected, or 0 anyway since background thread will retry */
+    /* Caller checks bcap_is_connected() to know actual state */
+    return connected ? 0 : -1;
 }
 
 void bcap_disconnect(bcap_ws_ctx_t *ctx) {
@@ -1080,14 +1214,423 @@ int bcap_subscribe(bcap_ws_ctx_t *ctx, const char *stream) {
     return ws_send_text(ctx->sock_fd, cmd);
 }
 
-int bcap_send_command(bcap_ws_ctx_t *ctx, const char *cmd) {
-    if (!ctx || !cmd || ctx->sock_fd < 0) return -1;
+
+/* ==========================================================================
+ * Persistent HTTP Client (replaces popen/curl for ~50x speedup on Pi Zero)
+ * Keeps a TCP connection alive to bettercap REST API.
+ * ========================================================================== */
+
+static int g_http_fd = -1;        /* Persistent REST API socket */
+static time_t g_http_last_use = 0; /* Last successful use time */
+
+/* Open/reuse persistent connection to bettercap REST API */
+static int http_ensure_connected(const char *host, int port) {
+    /* Reuse existing connection if recent */
+    if (g_http_fd >= 0) {
+        /* Quick liveness check: non-blocking peek */
+        char test;
+        int flags = fcntl(g_http_fd, F_GETFL, 0);
+        fcntl(g_http_fd, F_SETFL, flags | O_NONBLOCK);
+        ssize_t r = recv(g_http_fd, &test, 1, MSG_PEEK | MSG_DONTWAIT);
+        fcntl(g_http_fd, F_SETFL, flags); /* restore */
+        
+        if (r == 0) {
+            /* Server closed connection */
+            close(g_http_fd);
+            g_http_fd = -1;
+        } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            close(g_http_fd);
+            g_http_fd = -1;
+        }
+        /* r < 0 with EAGAIN means connection alive, no data pending = good */
+    }
     
-    char json[512];
-    snprintf(json, sizeof(json), "{\"cmd\":\"%s\"}", cmd);
+    if (g_http_fd >= 0) return g_http_fd;
     
-    return ws_send_text(ctx->sock_fd, json);
+    /* Open new connection */
+    struct sockaddr_in addr;
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, host, &addr.sin_addr);
+    
+    /* Quick connect timeout (500ms) - it's localhost */
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    /* TCP_NODELAY for low latency */
+    int one = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    
+    /* Keep-alive */
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    /* Set longer timeout for actual operations */
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    g_http_fd = sock;
+    g_http_last_use = time(NULL);
+    return sock;
 }
+
+/* Robust send: handles partial writes */
+static ssize_t http_send_all(int fd, const char *buf, size_t len) {
+    size_t total_sent = 0;
+    while (total_sent < len) {
+        ssize_t n = send(fd, buf + total_sent, len - total_sent, MSG_NOSIGNAL);
+        if (n <= 0) return -1;
+        total_sent += n;
+    }
+    return (ssize_t)total_sent;
+}
+
+/* Send raw HTTP request and read response body */
+static int http_request(const char *host, int port,
+                        const char *method, const char *path,
+                        const char *auth_header,
+                        const char *body,
+                        char *resp_buf, size_t resp_size) {
+    int fd = http_ensure_connected(host, port);
+    if (fd < 0) return -1;
+    
+    /* Build HTTP request */
+    char req[2048];
+    int req_len;
+    
+    if (body && body[0]) {
+        req_len = snprintf(req, sizeof(req),
+            "%s %s HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Authorization: Basic %s\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n"
+            "%s",
+            method, path, host, port, auth_header,
+            strlen(body), body);
+    } else {
+        req_len = snprintf(req, sizeof(req),
+            "%s %s HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Authorization: Basic %s\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n",
+            method, path, host, port, auth_header);
+    }
+    
+    /* Send request */
+    if (http_send_all(fd, req, req_len) < 0) {
+        /* Connection broken - close and retry once */
+        close(fd);
+        g_http_fd = -1;
+        fd = http_ensure_connected(host, port);
+        if (fd < 0) return -1;
+        if (http_send_all(fd, req, req_len) < 0) {
+            close(fd);
+            g_http_fd = -1;
+            return -1;
+        }
+    }
+    
+    /* Read response headers + body */
+    size_t total = 0;
+    char *buf = resp_buf;
+    int content_length = -1;
+    char *body_start = NULL;
+    bool chunked = false;
+    
+    while (total < resp_size - 1) {
+        ssize_t n = recv(fd, buf + total, resp_size - 1 - total, 0);
+        if (n <= 0) break;
+        total += n;
+        buf[total] = '\0';
+        
+        /* Look for end of headers */
+        if (!body_start) {
+            body_start = strstr(buf, "\r\n\r\n");
+            if (body_start) {
+                body_start += 4;
+                
+                /* Parse Content-Length */
+                char *cl = strcasestr(buf, "Content-Length:");
+                if (cl) {
+                    content_length = atoi(cl + 15);
+                }
+                
+                /* Check for chunked encoding */
+                if (strcasestr(buf, "Transfer-Encoding: chunked")) {
+                    chunked = true;
+                }
+                
+                /* If we have Content-Length and enough body, done */
+                if (content_length >= 0) {
+                    size_t body_received = total - (body_start - buf);
+                    if ((int)body_received >= content_length) break;
+                }
+            }
+        } else if (content_length >= 0) {
+            size_t body_received = total - (body_start - buf);
+            if ((int)body_received >= content_length) break;
+        }
+    }
+    
+    g_http_last_use = time(NULL);
+    
+    if (!body_start || total == 0) {
+        /* Bad response - close connection */
+        close(fd);
+        g_http_fd = -1;
+        return -1;
+    }
+    
+    /* Move body to start of buffer */
+    size_t body_len = total - (body_start - buf);
+    
+    /* For chunked responses, decode the first chunk */
+    if (chunked && body_len > 0) {
+        /* Find chunk size line */
+        char *chunk_end = strstr(body_start, "\r\n");
+        if (chunk_end) {
+            int chunk_size = (int)strtol(body_start, NULL, 16);
+            char *chunk_data = chunk_end + 2;
+            if (chunk_size > 0 && chunk_data + chunk_size <= buf + total) {
+                memmove(resp_buf, chunk_data, chunk_size);
+                resp_buf[chunk_size] = '\0';
+                return chunk_size;
+            }
+        }
+    }
+    
+    memmove(resp_buf, body_start, body_len);
+    resp_buf[body_len] = '\0';
+    return (int)body_len;
+}
+
+/* Pre-computed Base64 auth string */
+static char g_auth_b64[128] = {0};
+
+static void ensure_auth_header(const char *username, const char *password) {
+    if (g_auth_b64[0]) return;  /* Already computed */
+    
+    char raw[256];
+    snprintf(raw, sizeof(raw), "%s:%s", username, password);
+    base64_encode((const unsigned char *)raw, strlen(raw), g_auth_b64);
+}
+
+int bcap_send_command(bcap_ws_ctx_t *ctx, const char *cmd) {
+    if (!ctx || !cmd) return -1;
+
+    /* Commands go to REST API /api/session via persistent socket
+     * ~50x faster than popen("curl ...") on Pi Zero
+     */
+    ensure_auth_header(ctx->config.username, ctx->config.password);
+
+    /* Build JSON body */
+    char body[512];
+    snprintf(body, sizeof(body), "{\"cmd\":\"%s\"}", cmd);
+
+    char response[1024];
+    int ret = http_request(ctx->config.host, ctx->config.port,
+                          "POST", "/api/session",
+                          g_auth_b64, body,
+                          response, sizeof(response));
+
+    if (ret > 0 && strstr(response, "success\":true")) {
+        return 0;
+    }
+
+    /* Retry once on failure (connection may have been stale) */
+    if (g_http_fd >= 0) {
+        close(g_http_fd);
+        g_http_fd = -1;
+    }
+    ret = http_request(ctx->config.host, ctx->config.port,
+                      "POST", "/api/session",
+                      g_auth_b64, body,
+                      response, sizeof(response));
+
+    if (ret > 0 && strstr(response, "success\":true")) {
+        return 0;
+    }
+
+    {
+        static char _prev_fail[64] = "";
+        if (strncmp(_prev_fail, cmd, sizeof(_prev_fail)-1) != 0) {
+            fprintf(stderr, "[bcap] cmd failed: %s\n", cmd);
+            strncpy(_prev_fail, cmd, sizeof(_prev_fail)-1);
+        }
+    }
+    return -1;
+}
+
+/* ==========================================================================
+ * REST API Sync for APs
+ *
+ * This is now a PERIODIC RECONCILIATION, not the primary data source.
+ * Primary AP/STA tracking is event-driven via WebSocket events:
+ *   - wifi.ap.new    -> adds/updates AP in aps[]
+ *   - wifi.ap.lost   -> removes AP from aps[] (+ its clients from stas[])
+ *   - wifi.client.new -> adds/updates client in stas[]
+ *   - wifi.client.lost -> removes client from stas[]
+ *
+ * This REST sync runs every BCAP_SYNC_INTERVAL_S seconds to:
+ *   1. Reconcile any missed events
+ *   2. Update RSSI values (bettercap doesn't fire events for RSSI changes)
+ *   3. Catch edge cases (reconnection, event buffer overflow)
+ *
+ * Impact: Reduces bettercap Session.Lock() contention from every ~5s to
+ * every 60s, freeing ~2.6s per brain cycle of serialization stall.
+ * ========================================================================== */
+
+/* Delta state for filtered logging (moved here, macros defined earlier) */
+static int last_logged_ap_count = -1;
+static int last_logged_sta_count = -1;
+
+bool bcap_needs_sync(bcap_ws_ctx_t *ctx) {
+    if (!ctx) return false;
+    if (!ctx->initial_sync_done) return true;  /* Always sync on first call */
+    time_t now = time(NULL);
+    return (now - ctx->last_full_sync) >= BCAP_SYNC_INTERVAL_S;
+}
+
+int bcap_poll_aps(bcap_ws_ctx_t *ctx) {
+    if (!ctx || ctx->state != BCAP_STATE_CONNECTED) return -1;
+
+    /* Use persistent HTTP socket instead of popen("curl ...")
+     * ~50x faster on Pi Zero - no fork/exec overhead
+     */
+    ensure_auth_header(ctx->config.username, ctx->config.password);
+
+    char buffer[131072];  /* 128KB - safe for 50+ APs with full client lists */
+    int ret = http_request(ctx->config.host, ctx->config.port,
+                          "GET", "/api/session/wifi",
+                          g_auth_b64, NULL,
+                          buffer, sizeof(buffer));
+
+    if (ret <= 0) {
+        /* Retry once */
+        if (g_http_fd >= 0) { close(g_http_fd); g_http_fd = -1; }
+        ret = http_request(ctx->config.host, ctx->config.port,
+                          "GET", "/api/session/wifi",
+                          g_auth_b64, NULL,
+                          buffer, sizeof(buffer));
+        if (ret <= 0) return -1;
+    }
+    
+    /* Parse JSON response */
+    cJSON *root = cJSON_Parse(buffer);
+    if (!root) return -1;
+    
+    cJSON *aps_arr = cJSON_GetObjectItem(root, "aps");
+    if (!aps_arr || !cJSON_IsArray(aps_arr)) {
+        cJSON_Delete(root);
+        return -1;
+    }
+    
+    pthread_mutex_lock(&ctx->data_lock);
+    
+    /* Clear old AP and station lists */
+    ctx->ap_count = 0;
+    ctx->sta_count = 0;
+    
+    /* Parse each AP */
+    cJSON *ap_item;
+    cJSON_ArrayForEach(ap_item, aps_arr) {
+        if (ctx->ap_count >= BCAP_MAX_APS) break;
+        
+        bcap_ap_t *ap = &ctx->aps[ctx->ap_count];
+        memset(ap, 0, sizeof(*ap));
+        
+        /* MAC/BSSID */
+        cJSON *mac = cJSON_GetObjectItem(ap_item, "mac");
+        if (mac && mac->valuestring) {
+            bcap_parse_mac(mac->valuestring, &ap->bssid);
+        }
+        
+        /* SSID/hostname */
+        cJSON *hostname = cJSON_GetObjectItem(ap_item, "hostname");
+        if (hostname && hostname->valuestring) {
+            strncpy(ap->ssid, hostname->valuestring, sizeof(ap->ssid) - 1);
+        }
+        
+        /* Channel */
+        cJSON *chan = cJSON_GetObjectItem(ap_item, "channel");
+        if (chan && cJSON_IsNumber(chan)) {
+            ap->channel = chan->valueint;
+        }
+        
+        /* RSSI */
+        cJSON *rssi = cJSON_GetObjectItem(ap_item, "rssi");
+        if (rssi && cJSON_IsNumber(rssi)) {
+            ap->rssi = rssi->valueint;
+        }
+        
+        /* Encryption */
+        cJSON *enc = cJSON_GetObjectItem(ap_item, "encryption");
+        if (enc && enc->valuestring) {
+            strncpy(ap->encryption, enc->valuestring, sizeof(ap->encryption) - 1);
+        }
+        
+        /* Handshake flag */
+        cJSON *hs = cJSON_GetObjectItem(ap_item, "handshake");
+        if (hs && cJSON_IsBool(hs)) {
+            ap->handshake_captured = cJSON_IsTrue(hs);
+        }
+
+        /* Parse clients and store in stas[] array */
+        cJSON *clients = cJSON_GetObjectItem(ap_item, "clients");
+        if (clients && cJSON_IsArray(clients)) {
+            ap->clients_count = cJSON_GetArraySize(clients);
+            cJSON *client_item;
+            cJSON_ArrayForEach(client_item, clients) {
+                if (ctx->sta_count >= BCAP_MAX_STAS) break;
+                bcap_sta_t *sta = &ctx->stas[ctx->sta_count];
+                memset(sta, 0, sizeof(*sta));
+                memcpy(&sta->ap_bssid, &ap->bssid, sizeof(mac_addr_t));
+                cJSON *mac = cJSON_GetObjectItem(client_item, "mac");
+                if (mac && mac->valuestring) bcap_parse_mac(mac->valuestring, &sta->mac);
+                cJSON *rssi = cJSON_GetObjectItem(client_item, "rssi");
+                if (rssi && cJSON_IsNumber(rssi)) sta->rssi = rssi->valueint;
+                ctx->sta_count++;
+            }
+        }
+
+        ctx->ap_count++;
+    }
+    
+    /* Delta-filtered logging: only log when counts change */
+    if (ctx->ap_count != last_logged_ap_count || ctx->sta_count != last_logged_sta_count) {
+        BCAP_LOG(BCAP_LOG_POLL, "[bcap:poll] APs=%d STAs=%d (delta: APs %+d, STAs %+d)\n",
+                 ctx->ap_count, ctx->sta_count,
+                 ctx->ap_count - (last_logged_ap_count >= 0 ? last_logged_ap_count : ctx->ap_count),
+                 ctx->sta_count - (last_logged_sta_count >= 0 ? last_logged_sta_count : ctx->sta_count));
+        last_logged_ap_count = ctx->ap_count;
+        last_logged_sta_count = ctx->sta_count;
+    }
+    
+    pthread_mutex_unlock(&ctx->data_lock);
+    
+    cJSON_Delete(root);
+    
+    /* Mark sync complete */
+    ctx->last_full_sync = time(NULL);
+    ctx->initial_sync_done = true;
+    
+    return ctx->ap_count;
+}
+
 
 int bcap_refresh_aps(bcap_ws_ctx_t *ctx) {
     return bcap_send_command(ctx, "wifi.show");
@@ -1153,4 +1696,19 @@ int bcap_find_ap(bcap_ws_ctx_t *ctx, const mac_addr_t *bssid, bcap_ap_t *ap) {
     pthread_mutex_unlock(&ctx->data_lock);
     
     return -1;
+}
+
+
+int bcap_get_sta(bcap_ws_ctx_t *ctx, int index, bcap_sta_t *sta) {
+    if (!ctx || !sta || index < 0) return -1;
+
+    pthread_mutex_lock(&ctx->data_lock);
+    if (index >= ctx->sta_count) {
+        pthread_mutex_unlock(&ctx->data_lock);
+        return -1;
+    }
+    *sta = ctx->stas[index];
+    pthread_mutex_unlock(&ctx->data_lock);
+
+    return 0;
 }
