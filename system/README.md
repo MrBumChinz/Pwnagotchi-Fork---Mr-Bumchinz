@@ -1,7 +1,8 @@
 # system/ — Runtime Infrastructure Files
 
 All the non-C files needed for a working PwnaUI pwnagotchi system.
-These get installed to the Pi's filesystem alongside the compiled `pwnaui` binary.
+These get installed to the Pi's filesystem during the pi-gen ISO build.
+The resulting image is ready to flash — boot the Pi and it just works.
 
 ## Directory Layout
 
@@ -76,11 +77,27 @@ multi-user.target
  └─ pisugar-toggle.service
 ```
 
+## ISO Build Flow (pi-gen)
+
+The ISO is built using [pi-gen](https://github.com/RPi-Distro/pi-gen) with custom stages.
+When you flash the image and boot, everything is already compiled, installed, and enabled:
+
+```
+stage3/
+├── 01-pwn-packages/    # apt: libpcap, gpsd, bluez, i2c-tools, python3, ...
+├── 03-bettercap-pwngrid/  # Compile & install Go bettercap + pwngrid
+├── 05-install-pwnaui/     # Compile & install pwnaui + bt_gps_receiver (C)
+└── 07-patches/            # Run install-system.sh → deploy scripts, services,
+                           #   caplets, config. Enable all systemd units.
+```
+
+The end user just flashes the SD card and boots. No manual steps.
+
 ## Notes
 
-- **bt_gps_receiver** is a compiled C binary (source in `pwnaui/src/`), not a script
-- **config.toml** is a template — fill in your API keys, BT MAC, WiFi passwords before use
-- **Python dependencies**: `bcap_gps_init.py` and `mode_toggle.py` need Python3 (already in Raspbian)
-- **pwnaui-set-theme** uses `python3 -c "import toml"` — needs `pip3 install toml`
+- **bt_gps_receiver** is a compiled C binary (source in `pwnaui/src/`), built during stage3/05
+- **config.toml** is a template — user can customise in `/etc/pwnagotchi/config.toml` after first boot
+- **Python3** is already in Raspberry Pi OS Lite — `bcap_gps_init.py` and `mode_toggle.py` use it
+- **pwnaui-set-theme** uses `python3 -c "import toml"` — `toml` pip package installed in stage3/01
 - **mode-toggle.service** is disabled by default (uses smbus2, alternative to pisugar-toggle)
-- **pisugar-toggle.service** is the active mode toggle (raw I2C, no Python deps beyond stdlib)
+- **pisugar-toggle.service** is the active mode toggle (raw I2C, no extra Python deps)

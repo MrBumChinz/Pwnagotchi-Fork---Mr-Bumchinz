@@ -1,14 +1,16 @@
 #!/bin/bash -e
 #
-# install-system.sh - Deploy all system runtime files to a Raspberry Pi
+# install-system.sh - Deploy all system runtime files into a pi-gen rootfs
 #
-# This script installs all the runtime infrastructure files needed for
-# the PwnaUI C pwnagotchi to function. Run as root on the target Pi
-# or use in a pi-gen stage3 build.
+# This script is called during the pi-gen ISO build process (stage3)
+# to install all runtime infrastructure files. The resulting image
+# boots and works immediately — no manual setup required.
 #
-# Usage:
-#   sudo ./system/install-system.sh           # Install on a running Pi
-#   sudo ./system/install-system.sh $ROOTFS   # Install into a pi-gen rootfs
+# Called by pi-gen:
+#   sudo ./system/install-system.sh ${ROOTFS_DIR}
+#
+# Can also be run on a live Pi for updates:
+#   sudo ./system/install-system.sh
 #
 
 set -e
@@ -91,13 +93,9 @@ fi
 echo ""
 echo "=== Installation complete ==="
 echo ""
-echo "File locations:"
+echo "Installed:"
 echo "  Scripts:   /usr/bin/pwnlib, monstart, monstop, bettercap-launcher"
 echo "  Scripts:   /usr/local/bin/bcap_gps_init.py, pwnaui-set-theme, ..."
 echo "  Caplets:   /usr/local/share/bettercap/caplets/pwnagotchi-{auto,manual}.cap"
 echo "  Config:    /etc/pwnagotchi/config.toml"
 echo "  Services:  /etc/systemd/system/{bettercap,pwnaui,pwngrid-peer,...}.service"
-echo ""
-echo "NOTE: bt_gps_receiver binary must be compiled from source (pwnaui/src/)"
-echo "NOTE: pwnaui binary must be compiled: cd pwnaui && make && sudo make install"
-echo "NOTE: bettercap and pwngrid must be installed separately (Go packages)"
