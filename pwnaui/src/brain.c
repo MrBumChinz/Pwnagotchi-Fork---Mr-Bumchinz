@@ -224,36 +224,13 @@ static bool check_home_network(brain_ctx_t *ctx) {
     return false;
 }
 
-/* Enter home mode: pause attacks, optionally connect to home network */
+/* Enter home mode: pause attacks on home network */
 static void enter_home_mode(brain_ctx_t *ctx) {
     if (ctx->home_mode_active) return;
     ctx->home_mode_active = true;
     ctx->home_mode_entered = time(NULL);
-    fprintf(stderr, "[brain] [home] HOME MODE ACTIVATED — pausing attacks (SSID: %s)\n",
-            ctx->config.home_ssid);
-
-    /* If PSK is configured, attempt connection.
-     * This is a best-effort connection — we don't block the brain thread.
-     * The actual connection happens asynchronously via system() */
-    if (ctx->config.home_psk[0] != '\0') {
-        /* Create temporary wpa_supplicant config */
-        FILE *f = fopen("/tmp/pwnaui_home.conf", "w");
-        if (f) {
-            fprintf(f, "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n");
-            fprintf(f, "update_config=1\n");
-            fprintf(f, "country=AU\n\n");
-            fprintf(f, "network={\n");
-            fprintf(f, "    ssid=\"%s\"\n", ctx->config.home_ssid);
-            fprintf(f, "    psk=\"%s\"\n", ctx->config.home_psk);
-            fprintf(f, "    key_mgmt=WPA-PSK\n");
-            fprintf(f, "}\n");
-            fclose(f);
-            /* Note: actual managed-mode connection is complex and
-             * requires stopping monitor mode. For now, we just pause
-             * attacks and log. Full auto-connect can be added later. */
-            fprintf(stderr, "[brain] [home] config written to /tmp/pwnaui_home.conf\n");
-        }
-    }
+    fprintf(stderr, "[brain] [home] HOME MODE ACTIVATED - pausing attacks (SSID: %s)\n",
+                ctx->config.home_ssid);
 }
 
 /* Exit home mode: resume attacks */
@@ -281,28 +258,13 @@ static bool check_home2_network(brain_ctx_t *ctx) {
     return false;
 }
 
-/* Sprint 8: Enter 2nd home mode (hotspot) - pause attacks, get internet */
+/* Enter 2nd home mode: pause attacks near hotspot */
 static void enter_home2_mode(brain_ctx_t *ctx) {
     if (ctx->home2_mode_active) return;
     ctx->home2_mode_active = true;
     ctx->home2_mode_entered = time(NULL);
     fprintf(stderr, "[brain] [home2] 2ND HOME (hotspot) ACTIVATED - pausing attacks (SSID: %s)\n",
-        ctx->config.home2_ssid);
-    if (ctx->config.home2_psk[0] != '\0') {
-        FILE *f = fopen("/tmp/pwnaui_home2.conf", "w");
-        if (f) {
-            fprintf(f, "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n");
-            fprintf(f, "update_config=1\n");
-            fprintf(f, "country=AU\n\n");
-            fprintf(f, "network={\n");
-            fprintf(f, "    ssid=\"%s\"\n", ctx->config.home2_ssid);
-            fprintf(f, "    psk=\"%s\"\n", ctx->config.home2_psk);
-            fprintf(f, "    key_mgmt=WPA-PSK\n");
-            fprintf(f, "}\n");
-            fclose(f);
-            fprintf(stderr, "[brain] [home2] config written to /tmp/pwnaui_home2.conf\n");
-        }
-    }
+            ctx->config.home2_ssid);
 }
 
 /* Sprint 8: Exit 2nd home mode */
@@ -452,7 +414,7 @@ brain_config_t brain_config_default(void) {
 
     /* Sprint 8: Hash sync (disabled by default) */
     .sync_config = { .github_repo = "MrBumChinz/Hash-Den", .github_token = "", .contributor_name = "pwnagotchi",
-                     .sync_interval = 21600, .enabled = true },       /* Must be reasonably close */
+                     .sync_interval = 1800, .enabled = true },       /* Must be reasonably close */
 
         /* Sprint 6: Stealth enhancements */
         .mac_rotation_enabled = true,
@@ -1516,22 +1478,23 @@ static void *brain_thread_func(void *arg) {
         /* Sprint 4 #9: Update mobility score */
         update_mobility(ctx);
 
+        /* Hash sync: runs every cycle regardless of mode, gated by interval + internet check */
+        if (hash_sync_is_due() && hash_sync_has_internet()) {
+            hash_sync_result_t sync_res;
+            hash_sync_run(&sync_res);
+            if (sync_res.success) {
+                fprintf(stderr, "[brain] [sync] OK: pushed=%d imported=%d\n",
+                        sync_res.hashes_pushed, sync_res.passwords_imported);
+            }
+            ap_db_export_json(NULL);
+        }
+
+
         /* Sprint 4 #12: Home mode detection */
         if (check_home_network(ctx)) {
             enter_home_mode(ctx);
             /* In home mode: skip attacks, idle and run cracking */
             if (ctx->home_mode_active) {
-                /* Sprint 8: Hash sync when on home network */
-                if (hash_sync_is_due() && hash_sync_has_internet()) {
-                    fprintf(stderr, "[brain] [home] Internet available - running hash sync\n");
-                    hash_sync_result_t _hsync;
-                    hash_sync_run(&_hsync);
-                    if (_hsync.success) {
-                        fprintf(stderr, "[brain] [home] sync OK: pushed=%d imported=%d\n",
-                            _hsync.hashes_pushed, _hsync.passwords_imported);
-                    }
-                    ap_db_export_json(NULL);
-                }
                 fprintf(stderr, "[brain] [home] skipping attacks (home mode)\n");
                 if (ctx->crack_mgr && ctx->crack_mgr->state != CRACK_RUNNING &&
                     !crack_mgr_exhausted(ctx->crack_mgr)) {
@@ -1551,16 +1514,6 @@ static void *brain_thread_func(void *arg) {
         if (!ctx->home_mode_active && check_home2_network(ctx)) {
             enter_home2_mode(ctx);
             if (ctx->home2_mode_active) {
-                if (hash_sync_is_due() && hash_sync_has_internet()) {
-                    fprintf(stderr, "[brain] [home2] Internet available - running hash sync\n");
-                    hash_sync_result_t sync_res;
-                    hash_sync_run(&sync_res);
-                    if (sync_res.success) {
-                        fprintf(stderr, "[brain] [home2] sync OK: pushed=%d imported=%d\n",
-                            sync_res.hashes_pushed, sync_res.passwords_imported);
-                    }
-                    ap_db_export_json(NULL);
-                }
                 sleep(30);
                 continue;
             }
