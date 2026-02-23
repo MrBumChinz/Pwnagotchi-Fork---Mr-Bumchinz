@@ -81,8 +81,11 @@ static int smbus_write_byte(int fd, uint8_t addr, uint8_t reg, uint8_t value) {
  * ========================================================================== */
 
 static pwnagotchi_mode_t read_mode_from_files(void) {
-    /* Always start in MANUAL mode on boot */
-    (void)MANUAL_FILE;  /* suppress unused warning */
+    /* Read persisted mode - if AUTO file exists, start in AUTO */
+    if (access(AUTO_FILE, F_OK) == 0) {
+        return MODE_AUTO;
+    }
+    /* Default to MANUAL if no file or only MANUAL file exists */
     return MODE_MANUAL;
 }
 
@@ -169,6 +172,15 @@ pisugar_tap_t pisugar_poll_tap(pisugar_ctx_t *ctx) {
     switch (ctx->btn_state) {
     case BTN_IDLE:
         if (btn_event) {
+            /* Vibration filter: reject button events that arrive within
+             * VIBRATION_FILTER_MS of the last completed tap cycle.
+             * Walking vibration causes the PiSugar3 latch register
+             * to fire spurious events. */
+            if (ctx->btn_last_tap_done_ms &&
+                (now - ctx->btn_last_tap_done_ms) < VIBRATION_FILTER_MS) {
+                /* Spurious event from vibration — ignore */
+                break;
+            }
             /* Button was pressed - record time, move to pressed state */
             ctx->btn_press_time = now;
             ctx->btn_state = BTN_PRESSED;
@@ -216,6 +228,7 @@ pisugar_tap_t pisugar_poll_tap(pisugar_ctx_t *ctx) {
             uint64_t gap = now - ctx->btn_release_time;
             if (gap <= TAP_DOUBLE_GAP_MS) {
                 result = TAP_DOUBLE;
+                ctx->btn_last_tap_done_ms = now;
                 ctx->btn_state = BTN_IDLE;
                 fprintf(stderr, "[pisugar] DOUBLE TAP detected (gap=%llu ms)\n",
                         (unsigned long long)gap);
@@ -223,6 +236,7 @@ pisugar_tap_t pisugar_poll_tap(pisugar_ctx_t *ctx) {
                 /* Too slow for double - report first as single,
                  * start tracking this as new press */
                 result = TAP_SINGLE;
+                ctx->btn_last_tap_done_ms = now;
                 ctx->btn_press_time = now;
                 ctx->btn_state = BTN_PRESSED;
                 fprintf(stderr, "[pisugar] SINGLE TAP (late 2nd press)\n");
@@ -233,6 +247,7 @@ pisugar_tap_t pisugar_poll_tap(pisugar_ctx_t *ctx) {
             if (wait > TAP_DOUBLE_GAP_MS) {
                 /* Double-tap window expired -> it's a single tap */
                 result = TAP_SINGLE;
+                ctx->btn_last_tap_done_ms = now;
                 ctx->btn_state = BTN_IDLE;
                 fprintf(stderr, "[pisugar] SINGLE TAP detected\n");
             }
@@ -392,8 +407,22 @@ pwnagotchi_mode_t pisugar_get_mode(pisugar_ctx_t *ctx) {
 
 int pisugar_toggle_mode(pisugar_ctx_t *ctx) {
     if (!ctx) return -1;
+
+    /* Cooldown: reject mode switches within MODE_COOLDOWN_MS of last change.
+     * Prevents phantom taps from walking vibration flipping modes rapidly. */
+    uint64_t now = pisugar_millis();
+    if (ctx->last_mode_switch_ms && (now - ctx->last_mode_switch_ms) < MODE_COOLDOWN_MS) {
+        fprintf(stderr, "[pisugar] mode switch REJECTED (cooldown %llums remaining)\n",
+                (unsigned long long)(MODE_COOLDOWN_MS - (now - ctx->last_mode_switch_ms)));
+        return 1;  /* Return 1 = rejected by cooldown (distinct from 0=success, -1=error) */
+    }
+
     pwnagotchi_mode_t new_mode = (ctx->current_mode == MODE_AUTO) ? MODE_MANUAL : MODE_AUTO;
-    return pisugar_set_mode(ctx, new_mode);
+    int ret = pisugar_set_mode(ctx, new_mode);
+    if (ret == 0) {
+        ctx->last_mode_switch_ms = now;
+    }
+    return ret;
 }
 
 /**

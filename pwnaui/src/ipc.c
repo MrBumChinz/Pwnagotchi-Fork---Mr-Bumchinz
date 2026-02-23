@@ -223,6 +223,8 @@ ipc_cmd_t ipc_parse_command(char *cmd, char **arg) {
     if (strcmp(cmd, "SET_PWNHUB_XP") == 0) return IPC_CMD_SET_PWNHUB_XP;
     if (strcmp(cmd, "SET_PWNHUB_STAGE") == 0) return IPC_CMD_SET_PWNHUB_STAGE;
     if (strcmp(cmd, "SET_PWNHUB_ENABLED") == 0) return IPC_CMD_SET_PWNHUB_ENABLED;
+    if (strcmp(cmd, "DEDUCT_SPIRIT") == 0) return IPC_CMD_DEDUCT_SPIRIT;
+    if (strcmp(cmd, "GET_SPIRIT") == 0) return IPC_CMD_GET_SPIRIT;
     
     return IPC_CMD_UNKNOWN;
 }

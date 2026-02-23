@@ -62,4 +62,7 @@ void cb_update_stats(cb_bandit_t *cb, int channel, int ap_count);
  */
 extern float ts_beta_sample(float alpha, float beta);
 
+int cb_save(const cb_bandit_t *cb);
+int cb_load(cb_bandit_t *cb);
+
 #endif /* CHANNEL_BANDIT_H */

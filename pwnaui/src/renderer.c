@@ -596,6 +596,13 @@ void renderer_render_ui(ui_state_t *state, uint8_t *framebuffer) {
     int mode_x = g_display_width - mode_width - 2;  /* 2px buffer from right edge */
     renderer_draw_text(state, framebuffer, mode_x, L->mode_y, state->mode, FONT_BOLD);
     
+    /* Mobility label (DRV/WLK/STA/SOK/CDN) — drawn just left of mode label */
+    if (state->mobility[0]) {
+        int mob_width = font_text_width(state->mobility, FONT_BOLD);
+        int mob_x = mode_x - mob_width - 4;  /* 4px gap before mode label */
+        renderer_draw_text(state, framebuffer, mob_x, L->mode_y, state->mobility, FONT_BOLD);
+    }
+    
     /* BT-Tether status - "BT ✓" or "BT ✗" */
     if (state->bluetooth[0]) {
         renderer_draw_text(state, framebuffer, L->bluetooth_x, L->bluetooth_y, state->bluetooth, FONT_BOLD);
@@ -670,32 +677,27 @@ void renderer_render_ui(ui_state_t *state, uint8_t *framebuffer) {
                  state->pwnhub_level, state->pwnhub_title, state->pwnhub_wins, state->pwnhub_battles);
         renderer_draw_text(state, framebuffer, right_x, right_y, buf, FONT_SMALL);
         
-        /* === MACRO ICONS: Just left of memtemp === */
-        /* Calculate combined macro percentage (0-100) as hunger indicator */
-        /* 3 icons = well-fed (>=67%), 2 icons = okay (>=34%), 1 icon = hungry (>=10%) */
-        /* Each macro is 0-50, total max is 150, so percentage = (total / 150) * 100 */
-        int total_macros = state->pwnhub_protein + state->pwnhub_fat + state->pwnhub_carbs;
-        int macro_percent = (total_macros * 100) / 150;  /* Max 50+50+50 = 150 */
+        /* === STAT ICONS: Food, Strength, Spirit — left of memtemp === */
+        /* Each stat has its own fill-level PNG (10/25/40/50/75/100%) */
         
         /* Flash state: toggle every ~500ms based on frame counter */
-        /* We use a simple static counter since we don't have actual timing here */
         static int flash_counter = 0;
         static int flash_state = 1;
         flash_counter++;
-        if (flash_counter >= 8) {  /* ~8 frames = ~500ms at 60fps, adjust as needed */
+        if (flash_counter >= 8) {
             flash_counter = 0;
             flash_state = !flash_state;
         }
         
-        /* Position macro icons to align with memtemp data row */
-        /* memtemp_data is at Y=95, line2 is at Y=108, so ~5px gap */
-        /* Icons with baseline_height 15 should start at Y=90 to have bottom at ~105 */
+        /* Position stat icons to align with memtemp data row */
         int macro_x = L->memtemp_x - 85;  /* 178 - 85 = 93 */
-        int macro_y = L->memtemp_data_y - 5;  /* Align with memtemp data row */
+        int macro_y = L->memtemp_data_y - 9;  /* Align with memtemp data row, nudged up 4px */
         
-        /* Draw macro indicator (1-3 icons based on fill level) */
-        icons_draw_macro_indicator(framebuffer, g_display_width, g_display_height,
-                                   macro_x, macro_y, macro_percent, flash_state, state->invert);
+        /* Draw all 3 stat icons with individual fill levels */
+        icons_draw_stat_indicators(framebuffer, g_display_width, g_display_height,
+                                   macro_x, macro_y,
+                                   state->pwnhub_food, state->pwnhub_strength, state->pwnhub_spirit,
+                                   flash_state, state->invert);
     }
 }
 

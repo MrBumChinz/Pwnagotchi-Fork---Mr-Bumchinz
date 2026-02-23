@@ -73,6 +73,8 @@ typedef struct {
 
     /* Whitelist (SSIDs to never attack) */
     char whitelist[STEALTH_MAX_WHITELIST][STEALTH_MAX_SSID_LEN];
+    char whitelist_psk[STEALTH_MAX_WHITELIST][128];    /* PSK per entry */
+    bool whitelist_home[STEALTH_MAX_WHITELIST];         /* Is this a "home" network? */
     int whitelist_count;
 
     /* MAC rotation */
@@ -271,5 +273,41 @@ const char *stealth_level_name(stealth_level_t level);
  * @return Mode name string
  */
 const char *stealth_mode_name(stealth_mode_t mode);
+
+/**
+ * Load whitelist from JSON file (SSIDs + optional PSKs)
+ * File format: [{"ssid":"...", "psk":"...", "home": true}, ...]
+ * @param ctx Stealth context
+ * @param path Path to whitelist JSON file
+ * @return Number of entries loaded, -1 on error
+ */
+int stealth_load_whitelist(stealth_ctx_t *ctx, const char *path);
+
+/**
+ * Add SSID to whitelist with optional PSK and home flag
+ * @param ctx Stealth context
+ * @param ssid SSID to add
+ * @param psk WPA PSK (can be NULL or empty)
+ * @param is_home Whether this is a "home" network (triggers home mode)
+ * @return 0 on success, -1 if full
+ */
+int stealth_add_whitelist_full(stealth_ctx_t *ctx, const char *ssid,
+                                const char *psk, bool is_home);
+
+/**
+ * Get PSK for a whitelisted SSID
+ * @param ctx Stealth context
+ * @param ssid SSID to look up
+ * @return PSK string or NULL if not found/no PSK
+ */
+const char *stealth_get_whitelist_psk(stealth_ctx_t *ctx, const char *ssid);
+
+/**
+ * Check if a whitelisted SSID is marked as "home"
+ * @param ctx Stealth context
+ * @param ssid SSID to check
+ * @return true if marked as home network
+ */
+bool stealth_is_home_network(stealth_ctx_t *ctx, const char *ssid);
 
 #endif /* STEALTH_H */

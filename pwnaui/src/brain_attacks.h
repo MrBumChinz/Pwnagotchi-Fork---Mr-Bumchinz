@@ -17,6 +17,7 @@
 /* Shared state for raw injection */
 extern int g_raw_sock;
 extern health_state_t *g_health_state;
+extern fw_health_t *g_fw_health;  /* Phase 1B: injection rate limiter */
 extern const uint8_t BCAST_MAC[6];
 
 /* Sequence counters */

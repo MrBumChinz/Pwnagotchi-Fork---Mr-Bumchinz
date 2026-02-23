@@ -89,6 +89,65 @@ static void update_mobility(brain_ctx_t *ctx) {
         fprintf(stderr, "[brain] [mobility] score=%.2f (gps=%.2f, ap_churn=%.2f, aps=%d)\n",
                 ctx->mobility_score, gps_component, ap_component, ctx->total_aps);
     }
+
+    /* Suppress mode detection for first 30s after boot (churn from 0→N is misleading) */
+    static int mobility_boot_skips = 2;  /* Skip first 2 checks (30s at 15s interval) */
+    if (mobility_boot_skips > 0) {
+        mobility_boot_skips--;
+        fprintf(stderr, "[brain] [mobility-dbg] BOOT GRACE: skipping mode detection (%d left)\n", mobility_boot_skips);
+        return;
+    }
+
+    /* Debug: always log mobility inputs for troubleshooting */
+    fprintf(stderr, "[brain] [mobility-dbg] spd=%.1fkm/h score=%.2f churn=%.2f(delta=%d/aps=%d) mode=%s\n",
+            (ctx->gps && ctx->gps->has_fix) ? (float)ctx->gps->speed_kmh : -1.0f,
+            ctx->mobility_score, 
+            (ctx->total_aps > 0) ? (float)ap_delta / (float)ctx->total_aps : 0.0f,
+            ap_delta, ctx->total_aps,
+            mobility_mode_label(ctx->mobility_ctx.current_mode));
+
+    /* Phase 1C: Feed data to mobility mode detector for DRV/WLK/STA switching.
+     * GPS speed_kmh is the primary signal; mobility_score + ap_churn are fallbacks.
+     * This was missing — mobility_mode_update() was never called, so the mode
+     * was stuck on STATIONARY forever. */
+    float gps_speed_kmh = -1.0f;  /* -1 = no GPS; classify() uses >= 0 as "GPS present" */
+    if (ctx->gps && ctx->gps->has_fix) {
+        gps_speed_kmh = (float)ctx->gps->speed_kmh;
+    }
+    /* Compute AP churn as fraction (0.0-1.0) for fallback when GPS unavailable */
+    float ap_churn_frac = 0.0f;
+    if (ctx->total_aps > 0) {
+        ap_churn_frac = (float)ap_delta / (float)ctx->total_aps;
+        if (ap_churn_frac > 1.0f) ap_churn_frac = 1.0f;
+    }
+    if (mobility_mode_update(&ctx->mobility_ctx, gps_speed_kmh,
+                             ctx->mobility_score, ap_churn_frac, ctx->total_aps)) {
+        /* Mode changed — apply new parameters to brain config */
+        const mobility_params_t *p = mobility_mode_get_params(&ctx->mobility_ctx);
+        ctx->config.recon_time = p->recon_time;
+        ctx->config.hop_recon_time = p->hop_recon_time;
+        ctx->config.min_recon_time = p->min_recon_time;
+        ctx->config.max_recon_time = p->max_recon_time;
+        ctx->config.throttle_a = p->throttle_a;
+        ctx->config.throttle_d = p->throttle_d;
+
+        /* Gate attack phases based on mobility mode */
+        if (p->pmkid_only) {
+            /* DRIVING: only PMKID (phase 0) and Passive (phase 7) */
+            for (int ph = 0; ph < BRAIN_NUM_ATTACK_PHASES; ph++)
+                ctx->config.attack_phase_enabled[ph] = (ph == 0 || ph == 7);
+        } else {
+            /* WALKING/STATIONARY: all phases enabled */
+            for (int ph = 0; ph < BRAIN_NUM_ATTACK_PHASES; ph++)
+                ctx->config.attack_phase_enabled[ph] = true;
+        }
+
+        fprintf(stderr, "[brain] [mobility] MODE APPLIED: %s recon=%d/%d throttle=%.1f/%.1f phases=%s deauth=%d assoc=%d\n",
+                mobility_mode_name(ctx->mobility_ctx.current_mode),
+                p->recon_time, p->hop_recon_time, p->throttle_a, p->throttle_d,
+                p->pmkid_only ? "PMKID-ONLY" : "ALL",
+                p->deauth_enabled, p->associate_enabled);
+    }
 }
 
 /* RSSI-proportional delay multiplier (#16).
@@ -224,13 +283,36 @@ static bool check_home_network(brain_ctx_t *ctx) {
     return false;
 }
 
-/* Enter home mode: pause attacks on home network */
+/* Enter home mode: pause attacks, optionally connect to home network */
 static void enter_home_mode(brain_ctx_t *ctx) {
     if (ctx->home_mode_active) return;
     ctx->home_mode_active = true;
     ctx->home_mode_entered = time(NULL);
-    fprintf(stderr, "[brain] [home] HOME MODE ACTIVATED - pausing attacks (SSID: %s)\n",
-                ctx->config.home_ssid);
+    fprintf(stderr, "[brain] [home] HOME MODE ACTIVATED — pausing attacks (SSID: %s)\n",
+            ctx->config.home_ssid);
+
+    /* If PSK is configured, attempt connection.
+     * This is a best-effort connection — we don't block the brain thread.
+     * The actual connection happens asynchronously via system() */
+    if (ctx->config.home_psk[0] != '\0') {
+        /* Create temporary wpa_supplicant config */
+        FILE *f = fopen("/tmp/pwnaui_home.conf", "w");
+        if (f) {
+            fprintf(f, "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n");
+            fprintf(f, "update_config=1\n");
+            fprintf(f, "country=AU\n\n");
+            fprintf(f, "network={\n");
+            fprintf(f, "    ssid=\"%s\"\n", ctx->config.home_ssid);
+            fprintf(f, "    psk=\"%s\"\n", ctx->config.home_psk);
+            fprintf(f, "    key_mgmt=WPA-PSK\n");
+            fprintf(f, "}\n");
+            fclose(f);
+            /* Note: actual managed-mode connection is complex and
+             * requires stopping monitor mode. For now, we just pause
+             * attacks and log. Full auto-connect can be added later. */
+            fprintf(stderr, "[brain] [home] config written to /tmp/pwnaui_home.conf\n");
+        }
+    }
 }
 
 /* Exit home mode: resume attacks */
@@ -258,13 +340,28 @@ static bool check_home2_network(brain_ctx_t *ctx) {
     return false;
 }
 
-/* Enter 2nd home mode: pause attacks near hotspot */
+/* Sprint 8: Enter 2nd home mode (hotspot) - pause attacks, get internet */
 static void enter_home2_mode(brain_ctx_t *ctx) {
     if (ctx->home2_mode_active) return;
     ctx->home2_mode_active = true;
     ctx->home2_mode_entered = time(NULL);
     fprintf(stderr, "[brain] [home2] 2ND HOME (hotspot) ACTIVATED - pausing attacks (SSID: %s)\n",
-            ctx->config.home2_ssid);
+        ctx->config.home2_ssid);
+    if (ctx->config.home2_psk[0] != '\0') {
+        FILE *f = fopen("/tmp/pwnaui_home2.conf", "w");
+        if (f) {
+            fprintf(f, "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n");
+            fprintf(f, "update_config=1\n");
+            fprintf(f, "country=AU\n\n");
+            fprintf(f, "network={\n");
+            fprintf(f, "    ssid=\"%s\"\n", ctx->config.home2_ssid);
+            fprintf(f, "    psk=\"%s\"\n", ctx->config.home2_psk);
+            fprintf(f, "    key_mgmt=WPA-PSK\n");
+            fprintf(f, "}\n");
+            fclose(f);
+            fprintf(stderr, "[brain] [home2] config written to /tmp/pwnaui_home2.conf\n");
+        }
+    }
 }
 
 /* Sprint 8: Exit 2nd home mode */
@@ -414,7 +511,7 @@ brain_config_t brain_config_default(void) {
 
     /* Sprint 8: Hash sync (disabled by default) */
     .sync_config = { .github_repo = "MrBumChinz/Hash-Den", .github_token = "", .contributor_name = "pwnagotchi",
-                     .sync_interval = 1800, .enabled = true },       /* Must be reasonably close */
+                     .sync_interval = 21600, .enabled = true },       /* Must be reasonably close */
 
         /* Sprint 6: Stealth enhancements */
         .mac_rotation_enabled = true,
@@ -941,7 +1038,24 @@ static void brain_update_mood(brain_ctx_t *ctx) {
     } else if (e->active_for >= 5 && brain_has_support_network(ctx, 5.0f)) {
         brain_set_mood(ctx, MOOD_GRATEFUL);
     } else {
-        brain_set_mood(ctx, MOOD_NORMAL);
+        /* Phase 2.5: Set mood based on mobility mode instead of generic NORMAL */
+        switch (ctx->mobility_ctx.current_mode) {
+            case MOBILITY_DRIVING:
+                brain_set_mood(ctx, MOOD_DRIVING);
+                break;
+            case MOBILITY_WALKING:
+                brain_set_mood(ctx, MOOD_WALKING);
+                break;
+            case MOBILITY_STATIONARY:
+            default:
+                /* Stationary: hunting (actively attacking) vs soaking (passive) */
+                if (e->num_deauths > 0 || e->num_assocs > 0) {
+                    brain_set_mood(ctx, MOOD_HUNTING);
+                } else {
+                    brain_set_mood(ctx, MOOD_NORMAL);
+                }
+                break;
+        }
     }
 }
 
@@ -1261,6 +1375,10 @@ static void *brain_thread_func(void *arg) {
     ctx->home_mode_active = false;
     ctx->home_mode_entered = 0;
 
+    /* Phase 1C: Initialize mobility mode detector */
+    mobility_mode_init(&ctx->mobility_ctx);
+    fprintf(stderr, "[brain] Mobility mode detector initialized\n");
+
     /* Starting mood */
     brain_set_mood(ctx, MOOD_STARTING);
     
@@ -1333,25 +1451,21 @@ static void *brain_thread_func(void *arg) {
     bool was_manual = false;
     while (ctx->running) {
         /* ---- MANUAL MODE GATE ----
-         * When MANUAL, freeze bettercap (SIGSTOP) to save ~80% CPU on Pi Zero.
-         * When returning to AUTO, SIGCONT resumes bettercap and all its modules. */
+         * When MANUAL, brain idles — no autonomous attacks.
+         * Bettercap stays running so user can control it manually. */
         if (ctx->manual_mode) {
             if (!was_manual) {
-                fprintf(stderr, "[brain] MANUAL MODE - freezing bettercap\n");
-                system("killall -STOP bettercap 2>/dev/null");
+                fprintf(stderr, "[brain] MANUAL MODE - brain idle, bettercap stays running\n");
                 brain_set_mood(ctx, MOOD_BORED);
                 was_manual = true;
             }
-            /* bettercap is frozen - no bcap_poll needed */
             usleep(500000);
             continue;
         }
         if (was_manual) {
-            fprintf(stderr, "[brain] AUTO MODE - resuming bettercap\n");
-            system("killall -CONT bettercap 2>/dev/null");
+            fprintf(stderr, "[brain] AUTO MODE - brain resuming autonomous attacks\n");
             was_manual = false;
-            usleep(2000000);
-            continue;
+            /* Fall through to normal epoch loop */
         }
 
         /* Mode Bandit: Select operating mode at start of epoch */
@@ -1478,23 +1592,22 @@ static void *brain_thread_func(void *arg) {
         /* Sprint 4 #9: Update mobility score */
         update_mobility(ctx);
 
-        /* Hash sync: runs every cycle regardless of mode, gated by interval + internet check */
-        if (hash_sync_is_due() && hash_sync_has_internet()) {
-            hash_sync_result_t sync_res;
-            hash_sync_run(&sync_res);
-            if (sync_res.success) {
-                fprintf(stderr, "[brain] [sync] OK: pushed=%d imported=%d\n",
-                        sync_res.hashes_pushed, sync_res.passwords_imported);
-            }
-            ap_db_export_json(NULL);
-        }
-
-
         /* Sprint 4 #12: Home mode detection */
         if (check_home_network(ctx)) {
             enter_home_mode(ctx);
             /* In home mode: skip attacks, idle and run cracking */
             if (ctx->home_mode_active) {
+                /* Sprint 8: Hash sync when on home network */
+                if (hash_sync_is_due() && hash_sync_has_internet()) {
+                    fprintf(stderr, "[brain] [home] Internet available - running hash sync\n");
+                    hash_sync_result_t _hsync;
+                    hash_sync_run(&_hsync);
+                    if (_hsync.success) {
+                        fprintf(stderr, "[brain] [home] sync OK: pushed=%d imported=%d\n",
+                            _hsync.hashes_pushed, _hsync.passwords_imported);
+                    }
+                    ap_db_export_json(NULL);
+                }
                 fprintf(stderr, "[brain] [home] skipping attacks (home mode)\n");
                 if (ctx->crack_mgr && ctx->crack_mgr->state != CRACK_RUNNING &&
                     !crack_mgr_exhausted(ctx->crack_mgr)) {
@@ -1514,6 +1627,16 @@ static void *brain_thread_func(void *arg) {
         if (!ctx->home_mode_active && check_home2_network(ctx)) {
             enter_home2_mode(ctx);
             if (ctx->home2_mode_active) {
+                if (hash_sync_is_due() && hash_sync_has_internet()) {
+                    fprintf(stderr, "[brain] [home2] Internet available - running hash sync\n");
+                    hash_sync_result_t sync_res;
+                    hash_sync_run(&sync_res);
+                    if (sync_res.success) {
+                        fprintf(stderr, "[brain] [home2] sync OK: pushed=%d imported=%d\n",
+                            sync_res.hashes_pushed, sync_res.passwords_imported);
+                    }
+                    ap_db_export_json(NULL);
+                }
                 sleep(30);
                 continue;
             }

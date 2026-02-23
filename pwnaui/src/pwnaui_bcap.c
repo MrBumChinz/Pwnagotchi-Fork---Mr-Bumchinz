@@ -217,7 +217,7 @@ static void init_ui_state(void) {
     strncpy(g_ui_state.uptime, "00:00:00:00", sizeof(g_ui_state.uptime) - 1);
     strncpy(g_ui_state.shakes, "0", sizeof(g_ui_state.shakes) - 1);
     strncpy(g_ui_state.mode, "AUTO", sizeof(g_ui_state.mode) - 1);
-    strncpy(g_ui_state.status, "Initializing...", sizeof(g_ui_state.status) - 1);
+    strncpy(g_ui_state.status, "Need coffee... don't talk to me yet", sizeof(g_ui_state.status) - 1);
     strncpy(g_ui_state.bluetooth, "BT-", sizeof(g_ui_state.bluetooth) - 1);
     strncpy(g_ui_state.gps, "GPS-", sizeof(g_ui_state.gps) - 1);
     
@@ -459,18 +459,22 @@ static int handle_command(const char *cmd, char *response, size_t resp_size) {
         return -1;
     }
     
-    /* SET_PWNHUB_MACROS protein fat carbs - Set macro values (0-50 each) */
+    /* SET_PWNHUB_MACROS food strength spirit — only spirit accepted (food/strength are local) */
     if (strcmp(cmd_name, "SET_PWNHUB_MACROS") == 0) {
-        int protein, fat, carbs;
-        if (sscanf(cmd, "SET_PWNHUB_MACROS %d %d %d", &protein, &fat, &carbs) == 3) {
-            g_ui_state.pwnhub_protein = (protein < 0) ? 0 : (protein > 50) ? 50 : protein;
-            g_ui_state.pwnhub_fat = (fat < 0) ? 0 : (fat > 50) ? 50 : fat;
-            g_ui_state.pwnhub_carbs = (carbs < 0) ? 0 : (carbs > 50) ? 50 : carbs;
+        int food, strength, spirit;
+        if (sscanf(cmd, "SET_PWNHUB_MACROS %d %d %d", &food, &strength, &spirit) == 3) {
+            /* Food and strength are calculated locally — only accept spirit */
+            g_ui_state.pwnhub_spirit = (spirit < 0) ? 0 : (spirit > 100) ? 100 : spirit;
+            /* Save spirit to disk for persistence across reboots */
+            {
+                FILE *sf = fopen("/var/lib/pwnagotchi/pwnhub_spirit.txt", "w");
+                if (sf) { fprintf(sf, "%d", g_ui_state.pwnhub_spirit); fclose(sf); }
+            }
             g_dirty = 1;
             snprintf(response, resp_size, "OK\n");
             return 0;
         }
-        snprintf(response, resp_size, "ERR Invalid SET_PWNHUB_MACROS params (need: protein fat carbs)\n");
+        snprintf(response, resp_size, "ERR Invalid SET_PWNHUB_MACROS params (need: food strength spirit)\n");
         return -1;
     }
     

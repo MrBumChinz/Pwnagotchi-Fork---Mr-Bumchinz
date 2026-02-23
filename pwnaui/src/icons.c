@@ -12,12 +12,27 @@
 #include "renderer.h"
 #include "lodepng.h"
 
-/* PNG macro icons (loaded from files) */
-static png_icon_t g_macro_icons[MACRO_ICON_COUNT];
-static const char *g_macro_icon_paths[MACRO_ICON_COUNT] = {
-    "/home/pi/pwnaui/assets/Protein.png",
-    "/home/pi/pwnaui/assets/Fat.png",
-    "/home/pi/pwnaui/assets/carbs.png"
+/* PNG stat icons with fill levels (loaded from files) */
+/* Each stat has multiple fill-level PNGs: Food(10,40,75,100), Strength(10,40,75,100), Spirit(10,25,50,75,100) */
+static png_icon_t g_stat_icons[STAT_ICON_COUNT][MAX_FILL_LEVELS];
+static int g_stat_fill_values[STAT_ICON_COUNT][MAX_FILL_LEVELS] = {
+    { 0, 11, 41, 76, -1 },    /* Food fill levels */
+    { 0, 11, 41, 76, -1 },    /* Strength fill levels */
+    { 0, 11, 26, 51, 76 },    /* Spirit fill levels */
+};
+static int g_stat_fill_count[STAT_ICON_COUNT] = {
+    FOOD_FILL_LEVELS,
+    STRENGTH_FILL_LEVELS,
+    SPIRIT_FILL_LEVELS,
+};
+static const char *g_stat_icon_paths[STAT_ICON_COUNT][MAX_FILL_LEVELS] = {
+    { "/home/pi/pwnaui/assets/Food_10.png", "/home/pi/pwnaui/assets/Food_40.png",
+      "/home/pi/pwnaui/assets/Food_75.png", "/home/pi/pwnaui/assets/Food_100.png", NULL },
+    { "/home/pi/pwnaui/assets/Strength_10.png", "/home/pi/pwnaui/assets/Strength_40.png",
+      "/home/pi/pwnaui/assets/Strength_75.png", "/home/pi/pwnaui/assets/Strength_100.png", NULL },
+    { "/home/pi/pwnaui/assets/Spirit_10.png", "/home/pi/pwnaui/assets/Spirit_25.png",
+      "/home/pi/pwnaui/assets/Spirit_50.png", "/home/pi/pwnaui/assets/Spirit_75.png",
+      "/home/pi/pwnaui/assets/Spirit_100.png" },
 };
 
 /*
@@ -241,15 +256,20 @@ static const icon_t g_icons[] = {
  * Initialize icon system
  */
 int icons_init(void) {
-    fprintf(stderr, "[icons] Initializing macro icons...\n");
-    /* Load PNG macro icons */
-    for (int i = 0; i < MACRO_ICON_COUNT; i++) {
-        fprintf(stderr, "[icons] Loading icon %d: %s\n", i, g_macro_icon_paths[i]);
-        if (load_png_icon(g_macro_icon_paths[i], &g_macro_icons[i]) != 0) {
-            fprintf(stderr, "[icons] Warning: Failed to load macro icon %d\n", i);
+    static const char *stat_names[] = { "Food", "Strength", "Spirit" };
+    fprintf(stderr, "[icons] Initializing stat icons (Food/Strength/Spirit)...\n");
+    /* Load all fill-level PNGs for each stat */
+    for (int s = 0; s < STAT_ICON_COUNT; s++) {
+        for (int f = 0; f < g_stat_fill_count[s]; f++) {
+            const char *path = g_stat_icon_paths[s][f];
+            if (!path) continue;
+            fprintf(stderr, "[icons] Loading %s %d%%: %s\n", stat_names[s], g_stat_fill_values[s][f], path);
+            if (load_png_icon(path, &g_stat_icons[s][f]) != 0) {
+                fprintf(stderr, "[icons] Warning: Failed to load %s %d%%\n", stat_names[s], g_stat_fill_values[s][f]);
+            }
         }
     }
-    fprintf(stderr, "[icons] Macro icon init complete\n");
+    fprintf(stderr, "[icons] Stat icon init complete\n");
     return 0;
 }
 
@@ -257,12 +277,14 @@ int icons_init(void) {
  * Cleanup icon resources
  */
 void icons_cleanup(void) {
-    /* Free PNG macro icons */
-    for (int i = 0; i < MACRO_ICON_COUNT; i++) {
-        if (g_macro_icons[i].bitmap) {
-            free(g_macro_icons[i].bitmap);
-            g_macro_icons[i].bitmap = NULL;
-            g_macro_icons[i].loaded = 0;
+    /* Free stat icon PNGs */
+    for (int s = 0; s < STAT_ICON_COUNT; s++) {
+        for (int f = 0; f < MAX_FILL_LEVELS; f++) {
+            if (g_stat_icons[s][f].bitmap) {
+                free(g_stat_icons[s][f].bitmap);
+                g_stat_icons[s][f].bitmap = NULL;
+                g_stat_icons[s][f].loaded = 0;
+            }
         }
     }
 }
@@ -333,195 +355,166 @@ void icons_draw(uint8_t *framebuffer, const char *name, int x, int y) {
 }
 
 /*
- * Get macro icon by index
+ * Get the best fill-level icon for a stat at a given percentage.
+ * Picks the closest fill-level that doesn't exceed the actual percentage.
+ * E.g. 60% food → Food_40.png (next lower), 100% → Food_100.png
  */
+const png_icon_t *icons_get_stat(int stat_index, int fill_percent) {
+    if (stat_index < 0 || stat_index >= STAT_ICON_COUNT) return NULL;
+    if (fill_percent <= 0) return NULL;
+
+    int count = g_stat_fill_count[stat_index];
+    int best = -1;
+    for (int i = 0; i < count; i++) {
+        if (g_stat_fill_values[stat_index][i] <= fill_percent) {
+            best = i;  /* Keep the highest fill level <= requested */
+        }
+    }
+    if (best < 0) best = 0;  /* If all levels are above, use lowest */
+    if (!g_stat_icons[stat_index][best].loaded) return NULL;
+    return &g_stat_icons[stat_index][best];
+}
+
+/* Legacy accessor — returns 100% fill icon */
 const png_icon_t *icons_get_macro(int index) {
-    if (index < 0 || index >= MACRO_ICON_COUNT) {
-        return NULL;
-    }
-    if (!g_macro_icons[index].loaded) {
-        return NULL;
-    }
-    return &g_macro_icons[index];
+    return icons_get_stat(index, 100);
 }
 
 /*
- * Draw a single macro icon to framebuffer
+ * Internal: draw a png_icon_t to framebuffer (unscaled)
  */
-int icons_draw_macro(uint8_t *framebuffer, int fb_width, int fb_height,
-                     int icon_index, int x, int y, int invert) {
-    const png_icon_t *icon = icons_get_macro(icon_index);
-    if (!icon || !icon->bitmap) {
-        return -1;
-    }
-    
-    /* Render with same logic as theme_render_face */
+static int draw_png_icon(const png_icon_t *icon, uint8_t *framebuffer,
+                         int fb_width, int fb_height, int x, int y, int invert) {
+    if (!icon || !icon->bitmap) return -1;
+
     for (int iy = 0; iy < icon->height; iy++) {
         int screen_y = y + iy;
         if (screen_y < 0 || screen_y >= fb_height) continue;
-        
         for (int ix = 0; ix < icon->width; ix++) {
             int screen_x = x + ix;
             if (screen_x < 0 || screen_x >= fb_width) continue;
-            
-            /* Get pixel from icon bitmap (1 = black in source) */
             int src_byte = iy * icon->stride + ix / 8;
             int src_bit = 7 - (ix % 8);
             int pixel = (icon->bitmap[src_byte] >> src_bit) & 1;
-            
-            /* Invert: PNG has 1=black, framebuffer needs 0=black for e-ink */
-            pixel = !pixel;
-            
-            if (invert) {
-                pixel = !pixel;
-            }
-            
-            /* Set pixel in framebuffer */
+            pixel = !pixel;  /* PNG 1=black → framebuffer 0=black */
+            if (invert) pixel = !pixel;
             int fb_byte = (screen_y * fb_width + screen_x) / 8;
             int fb_bit = 7 - (screen_x % 8);
-            
-            if (pixel) {
-                framebuffer[fb_byte] |= (1 << fb_bit);
-            } else {
-                framebuffer[fb_byte] &= ~(1 << fb_bit);
-            }
+            if (pixel) framebuffer[fb_byte] |= (1 << fb_bit);
+            else       framebuffer[fb_byte] &= ~(1 << fb_bit);
         }
     }
-    
     return 0;
 }
 
 /*
- * Draw a macro icon scaled to specific dimensions
- * Uses nearest-neighbor scaling for crisp e-ink output
+ * Internal: draw a png_icon_t scaled to specific dimensions
  */
-int icons_draw_macro_scaled(uint8_t *framebuffer, int fb_width, int fb_height,
-                            int icon_index, int x, int y, 
-                            int dst_w, int dst_h, int invert) {
-    const png_icon_t *icon = icons_get_macro(icon_index);
-    if (!icon || !icon->bitmap) {
-        return -1;
-    }
-    
+static int draw_png_icon_scaled(const png_icon_t *icon, uint8_t *framebuffer,
+                                int fb_width, int fb_height,
+                                int x, int y, int dst_w, int dst_h, int invert) {
+    if (!icon || !icon->bitmap) return -1;
     int src_w = icon->width;
     int src_h = icon->height;
-    
-    /* Render with nearest-neighbor scaling */
+
     for (int dy = 0; dy < dst_h; dy++) {
         int screen_y = y + dy;
         if (screen_y < 0 || screen_y >= fb_height) continue;
-        
-        /* Map destination Y to source Y */
         int src_y = (dy * src_h) / dst_h;
-        
         for (int dx = 0; dx < dst_w; dx++) {
             int screen_x = x + dx;
             if (screen_x < 0 || screen_x >= fb_width) continue;
-            
-            /* Map destination X to source X */
             int src_x = (dx * src_w) / dst_w;
-            
-            /* Get pixel from icon bitmap */
             int src_byte = src_y * icon->stride + src_x / 8;
             int src_bit = 7 - (src_x % 8);
             int pixel = (icon->bitmap[src_byte] >> src_bit) & 1;
-            
-            /* Invert for e-ink */
             pixel = !pixel;
-            
-            if (invert) {
-                pixel = !pixel;
-            }
-            
-            /* Set pixel in framebuffer */
+            if (invert) pixel = !pixel;
             int fb_byte = (screen_y * fb_width + screen_x) / 8;
             int fb_bit = 7 - (screen_x % 8);
-            
-            if (pixel) {
-                framebuffer[fb_byte] |= (1 << fb_bit);
-            } else {
-                framebuffer[fb_byte] &= ~(1 << fb_bit);
-            }
+            if (pixel) framebuffer[fb_byte] |= (1 << fb_bit);
+            else       framebuffer[fb_byte] &= ~(1 << fb_bit);
         }
     }
-    
     return 0;
 }
 
+/* Draw stat icon at fill level */
+int icons_draw_stat(uint8_t *framebuffer, int fb_width, int fb_height,
+                    int stat_index, int fill_percent, int x, int y, int invert) {
+    const png_icon_t *icon = icons_get_stat(stat_index, fill_percent);
+    return draw_png_icon(icon, framebuffer, fb_width, fb_height, x, y, invert);
+}
+
+/* Draw stat icon scaled */
+int icons_draw_stat_scaled(uint8_t *framebuffer, int fb_width, int fb_height,
+                           int stat_index, int fill_percent, int x, int y,
+                           int dst_w, int dst_h, int invert) {
+    const png_icon_t *icon = icons_get_stat(stat_index, fill_percent);
+    return draw_png_icon_scaled(icon, framebuffer, fb_width, fb_height, x, y, dst_w, dst_h, invert);
+}
+
+/* Legacy draw functions (use icon by index at 100% fill) */
+int icons_draw_macro(uint8_t *framebuffer, int fb_width, int fb_height,
+                     int icon_index, int x, int y, int invert) {
+    return icons_draw_stat(framebuffer, fb_width, fb_height, icon_index, 100, x, y, invert);
+}
+
+int icons_draw_macro_scaled(uint8_t *framebuffer, int fb_width, int fb_height,
+                            int icon_index, int x, int y,
+                            int dst_w, int dst_h, int invert) {
+    return icons_draw_stat_scaled(framebuffer, fb_width, fb_height, icon_index, 100, x, y, dst_w, dst_h, invert);
+}
+
 /*
- * Draw macro icons based on overall macro percentage
- * 
- * Logic:
- *   >= 67% (2/3 full) -> Show 3 icons: 💪🥓🍞
- *   >= 34% (1/3 full) -> Show 2 icons: 💪🥓
- *   >= 10%            -> Show 1 icon:  💪
- *   < 10%             -> Flash 1 icon (if flash_state=1, show; else hide)
- *   0%                -> No icons
- *
- * Icons are bottom-aligned to sit 1-2px above a baseline.
- * Protein icon is scaled down ~15% to match Fat/Carbs height.
+ * Draw all 3 stat icons with individual fill levels.
+ * Exact same positions and sizes as the original Protein/Fat/Carbs layout:
+ *   Position 1: Spirit   — native size (23x20)
+ *   Position 2: Strength — native size (24x21)
+ *   Position 3: Food     — native size (24x21)
+ * All bottom-aligned to baseline_height=21, spacing=2.
+ * Each icon's fill-level PNG is chosen by its stat percentage.
+ * Icons flash if stat < 10%, hidden if stat == 0%.
  */
-void icons_draw_macro_indicator(uint8_t *framebuffer, int fb_width, int fb_height,
-                                int x, int y, int macro_percent, int flash_state, int invert) {
-    int num_icons = 0;
-    int flashing = 0;
-    
-    if (macro_percent >= 67) {
-        num_icons = 3;  /* Full - all 3 icons */
-    } else if (macro_percent >= 34) {
-        num_icons = 2;  /* 2/3 - 2 icons */
-    } else if (macro_percent >= 10) {
-        num_icons = 1;  /* Low - 1 icon */
-    } else if (macro_percent > 0) {
-        num_icons = 1;  /* Critical - flash 1 icon */
-        flashing = 1;
-    } else {
-        num_icons = 0;  /* Empty - no icons */
-    }
-    
-    /* If flashing and flash_state is 0, hide the icon */
-    if (flashing && !flash_state) {
-        return;  /* Don't draw anything during flash-off phase */
-    }
-    
-    /* Target baseline height (use Fat icon as reference ~15px) */
-    int baseline_height = 15;
-    int spacing = 2;  /* Gap between icons */
-    
-    /* Draw the appropriate number of icons */
-    int draw_x = x;
-    
-    /* Order: Protein, Fat, Carbs - all bottom-aligned */
-    if (num_icons >= 1) {
-        const png_icon_t *icon = icons_get_macro(MACRO_ICON_PROTEIN);
+void icons_draw_stat_indicators(uint8_t *framebuffer, int fb_width, int fb_height,
+                                int x, int y,
+                                int food_pct, int strength_pct, int spirit_pct,
+                                int flash_state, int invert) {
+    int baseline_height = 21;
+    /* Fixed positions so icons never shift when others are hidden */
+    /* Spirit: 23px wide, Strength: 24px wide, Food: 24px wide, spacing: 2px */
+    int spirit_x = x;            /* Position 1: x+0 */
+    int strength_x = x + 25;     /* Position 2: x+23+2 */
+    int food_x = x + 51;         /* Position 3: x+25+24+2 */
+
+    /* Icon 1: Spirit  fixed position */
+    if (spirit_pct > 0 && (spirit_pct >= 10 || flash_state)) {
+        const png_icon_t *icon = icons_get_stat(STAT_ICON_SPIRIT, spirit_pct);
         if (icon && icon->bitmap) {
-            /* Scale protein down ~15% (from 21 to ~18 height) */
-            int scaled_h = (icon->height * 85) / 100;  /* 85% of original */
-            int scaled_w = (icon->width * 85) / 100;
-            int icon_y = y + (baseline_height - scaled_h);  /* Bottom align */
-            icons_draw_macro_scaled(framebuffer, fb_width, fb_height,
-                                   MACRO_ICON_PROTEIN, draw_x, icon_y, 
-                                   scaled_w, scaled_h, invert);
-            draw_x += scaled_w + spacing;
+            int icon_y = y + (baseline_height - icon->height);
+            draw_png_icon(icon, framebuffer, fb_width, fb_height,
+                          spirit_x, icon_y, invert);
         }
     }
-    
-    if (num_icons >= 2) {
-        const png_icon_t *icon = icons_get_macro(MACRO_ICON_FAT);
+
+    /* Icon 2: Strength  fixed position */
+    if (strength_pct > 0 && (strength_pct >= 10 || flash_state)) {
+        const png_icon_t *icon = icons_get_stat(STAT_ICON_STRENGTH, strength_pct);
         if (icon && icon->bitmap) {
-            int icon_y = y + (baseline_height - icon->height);  /* Bottom align */
-            icons_draw_macro(framebuffer, fb_width, fb_height,
-                            MACRO_ICON_FAT, draw_x, icon_y, invert);
-            draw_x += icon->width + spacing;
+            int icon_y = y + (baseline_height - icon->height);
+            draw_png_icon(icon, framebuffer, fb_width, fb_height,
+                          strength_x, icon_y, invert);
         }
     }
-    
-    if (num_icons >= 3) {
-        const png_icon_t *icon = icons_get_macro(MACRO_ICON_CARBS);
+
+    /* Icon 3: Food  fixed position */
+    if (food_pct > 0 && (food_pct >= 10 || flash_state)) {
+        const png_icon_t *icon = icons_get_stat(STAT_ICON_FOOD, food_pct);
         if (icon && icon->bitmap) {
-            int icon_y = y + (baseline_height - icon->height);  /* Bottom align */
-            icons_draw_macro(framebuffer, fb_width, fb_height,
-                            MACRO_ICON_CARBS, draw_x, icon_y, invert);
+            int icon_y = y + (baseline_height - icon->height);
+            draw_png_icon(icon, framebuffer, fb_width, fb_height,
+                          food_x, icon_y, invert);
         }
     }
 }
+

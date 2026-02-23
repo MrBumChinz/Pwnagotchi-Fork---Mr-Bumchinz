@@ -75,6 +75,7 @@ int  ap_db_set_cracked(const char *bssid, const char *password);
 
 /* Update Thompson priors for an AP */
 int  ap_db_set_thompson(const char *bssid, float alpha, float beta);
+int  ap_db_set_clients(const char *bssid, int clients_seen);
 
 /* Update attack tracking */
 int  ap_db_record_attack(const char *bssid, int phase);

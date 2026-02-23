@@ -17,6 +17,7 @@
 #include "brain.h"
 #include "brain_attacks.h"
 #include "health_monitor.h"
+#include "firmware_health.h"
 
 /* Reason codes — expanded with WiFi 6e codes to evade WIDS fingerprinting */
 #define REASON_CLASS3_FRAME 7   /* Class 3 frame from nonassociated STA */
@@ -50,6 +51,7 @@ const uint8_t BCAST_MAC[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 
 /* Global raw injection socket */
 int g_raw_sock = -1;
+fw_health_t *g_fw_health = NULL;  /* Phase 1B: firmware rate limiter */
 health_state_t *g_health_state = NULL;  /* CPU profiler */
 
 
@@ -77,7 +79,16 @@ const char *brain_mood_names[] = {
     [MOOD_EXCITED]   = "excited",
     [MOOD_GRATEFUL]  = "grateful",
     [MOOD_SLEEPING]  = "sleeping",
-    [MOOD_REBOOTING] = "rebooting"
+    [MOOD_REBOOTING] = "rebooting",
+    [MOOD_DRIVING]   = "driving",
+    [MOOD_WALKING]   = "walking",
+    [MOOD_HUNTING]   = "hunting",
+    [MOOD_SOAKING]   = "soaking",
+    [MOOD_COOLDOWN]  = "cooldown",
+    [MOOD_JACKPOT]   = "jackpot",
+    [MOOD_PWNED]     = "pwned",
+    [MOOD_SCANNING]  = "scanning",
+    [MOOD_SYNCING]   = "syncing"
 };
 
 const char *brain_frustration_names[] = {
@@ -124,8 +135,25 @@ int attack_raw_inject_open(void) {
 
 int attack_raw_send(int sock, const uint8_t *frame, size_t len) {
     if (sock < 0 || !frame || len == 0) return -1;
+
+    /* Phase 1B: Check firmware health rate limiter */
+    if (g_fw_health && !fw_health_can_inject(g_fw_health)) {
+        return -2;  /* Throttled — not a real failure */
+    }
+
     ssize_t sent = write(sock, frame, len);
-    return (sent > 0) ? (int)sent : -1;
+    int result = (sent > 0) ? (int)sent : -1;
+
+    /* Phase 1B: Report outcome to firmware health */
+    if (g_fw_health) {
+        if (result > 0) {
+            fw_health_report_success(g_fw_health);
+        } else {
+            fw_health_report_failure(g_fw_health);
+        }
+    }
+
+    return result;
 }
 
 /* ============================================================================

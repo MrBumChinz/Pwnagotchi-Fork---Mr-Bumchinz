@@ -50,7 +50,17 @@ SOURCES = $(SRCDIR)/pwnaui.c \
           $(SRCDIR)/webserver.c \
           $(SRCDIR)/gps_refine.c \
           $(SRCDIR)/ap_database.c \
-          $(SRCDIR)/hash_sync.c
+          $(SRCDIR)/hash_sync.c \
+          $(SRCDIR)/eapol_monitor.c \
+	$(SRCDIR)/firmware_health.c \
+	$(SRCDIR)/mobility_mode.c \
+	$(SRCDIR)/channel_map.c \
+	$(SRCDIR)/rssi_trend.c \
+	$(SRCDIR)/ap_triage.c \
+	$(SRCDIR)/driving_mode.c \
+	$(SRCDIR)/stationary_mode.c \
+	$(SRCDIR)/walking_mode.c \
+        $(SRCDIR)/model_inference.c
 # Test sources (modules without main())
 TEST_MODULES = $(SRCDIR)/ipc.c \
                $(SRCDIR)/renderer.c \

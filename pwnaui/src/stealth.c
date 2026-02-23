@@ -17,6 +17,7 @@
 #include <ctype.h>
 
 #include "stealth.h"
+#include "cJSON.h"
 
 /* ============================================================================
  * Realistic OUI List (from Neurolyzer)
@@ -681,3 +682,134 @@ const char *stealth_mode_name(stealth_mode_t mode) {
         default:                   return "unknown";
     }
 }
+
+/* ============================================================================ 
+ * Extended Whitelist (JSON file with SSIDs, PSKs, home flags)
+ * ========================================================================== */
+
+int stealth_add_whitelist_full(stealth_ctx_t *ctx, const char *ssid,
+                                const char *psk, bool is_home) {
+    if (!ctx || !ssid) return -1;
+    if (ctx->config.whitelist_count >= STEALTH_MAX_WHITELIST) {
+        fprintf(stderr, "[stealth] whitelist full (max %d)\n", STEALTH_MAX_WHITELIST);
+        return -1;
+    }
+
+    /* Check if already in list */
+    for (int i = 0; i < ctx->config.whitelist_count; i++) {
+        if (strcasecmp(ctx->config.whitelist[i], ssid) == 0) {
+            /* Update PSK and home flag if already exists */
+            if (psk && psk[0] != '\0') {
+                strncpy(ctx->config.whitelist_psk[i], psk, 127);
+                ctx->config.whitelist_psk[i][127] = '\0';
+            }
+            ctx->config.whitelist_home[i] = is_home;
+            return 0;
+        }
+    }
+
+    int idx = ctx->config.whitelist_count;
+    strncpy(ctx->config.whitelist[idx], ssid, STEALTH_MAX_SSID_LEN - 1);
+    ctx->config.whitelist[idx][STEALTH_MAX_SSID_LEN - 1] = '\0';
+
+    if (psk && psk[0] != '\0') {
+        strncpy(ctx->config.whitelist_psk[idx], psk, 127);
+        ctx->config.whitelist_psk[idx][127] = '\0';
+    } else {
+        ctx->config.whitelist_psk[idx][0] = '\0';
+    }
+    ctx->config.whitelist_home[idx] = is_home;
+    ctx->config.whitelist_count++;
+
+    fprintf(stderr, "[stealth] whitelist[%d]: ssid=\"%s\" psk=%s home=%s\n",
+            idx, ssid, (psk && psk[0]) ? "***" : "(none)",
+            is_home ? "yes" : "no");
+    return 0;
+}
+
+int stealth_load_whitelist(stealth_ctx_t *ctx, const char *path) {
+    if (!ctx || !path) return -1;
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "[stealth] whitelist file not found: %s\n", path);
+        return -1;
+    }
+
+    /* Read entire file */
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (fsize <= 0 || fsize > 65536) {
+        fprintf(stderr, "[stealth] whitelist file too large or empty: %ld bytes\n", fsize);
+        fclose(f);
+        return -1;
+    }
+
+    char *json_str = malloc(fsize + 1);
+    if (!json_str) { fclose(f); return -1; }
+    fread(json_str, 1, fsize, f);
+    json_str[fsize] = '\0';
+    fclose(f);
+
+    /* Parse JSON array */
+    cJSON *root = cJSON_Parse(json_str);
+    free(json_str);
+    if (!root) {
+        fprintf(stderr, "[stealth] whitelist JSON parse error\n");
+        return -1;
+    }
+
+    if (!cJSON_IsArray(root)) {
+        fprintf(stderr, "[stealth] whitelist JSON is not an array\n");
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    int loaded = 0;
+    cJSON *entry;
+    cJSON_ArrayForEach(entry, root) {
+        cJSON *j_ssid = cJSON_GetObjectItem(entry, "ssid");
+        cJSON *j_psk  = cJSON_GetObjectItem(entry, "psk");
+        cJSON *j_home = cJSON_GetObjectItem(entry, "home");
+
+        if (!j_ssid || !cJSON_IsString(j_ssid)) continue;
+
+        const char *ssid = j_ssid->valuestring;
+        const char *psk  = (j_psk && cJSON_IsString(j_psk)) ? j_psk->valuestring : "";
+        bool is_home     = (j_home && cJSON_IsBool(j_home)) ? cJSON_IsTrue(j_home) : false;
+
+        if (stealth_add_whitelist_full(ctx, ssid, psk, is_home) == 0) {
+            loaded++;
+        }
+    }
+
+    cJSON_Delete(root);
+    fprintf(stderr, "[stealth] loaded %d whitelist entries from %s\n", loaded, path);
+    return loaded;
+}
+
+const char *stealth_get_whitelist_psk(stealth_ctx_t *ctx, const char *ssid) {
+    if (!ctx || !ssid) return NULL;
+    for (int i = 0; i < ctx->config.whitelist_count; i++) {
+        if (strcasecmp(ctx->config.whitelist[i], ssid) == 0) {
+            if (ctx->config.whitelist_psk[i][0] != '\0') {
+                return ctx->config.whitelist_psk[i];
+            }
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+bool stealth_is_home_network(stealth_ctx_t *ctx, const char *ssid) {
+    if (!ctx || !ssid) return false;
+    for (int i = 0; i < ctx->config.whitelist_count; i++) {
+        if (strcasecmp(ctx->config.whitelist[i], ssid) == 0) {
+            return ctx->config.whitelist_home[i];
+        }
+    }
+    return false;
+}
+

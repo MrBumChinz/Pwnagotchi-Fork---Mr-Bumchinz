@@ -34,10 +34,12 @@ typedef enum {
     IPC_CMD_SET_GPS_STATUS,
     IPC_CMD_GET_GPS,
     /* Phase 4: PwnHub Stats commands */
-    IPC_CMD_SET_PWNHUB_MACROS,    /* SET_PWNHUB_MACROS protein fat carbs (0-50 each) */
+    IPC_CMD_SET_PWNHUB_MACROS,    /* SET_PWNHUB_MACROS food strength spirit (0-100 each) */
     IPC_CMD_SET_PWNHUB_XP,        /* SET_PWNHUB_XP percent (0-100) */
     IPC_CMD_SET_PWNHUB_STAGE,     /* SET_PWNHUB_STAGE title level wins total */
     IPC_CMD_SET_PWNHUB_ENABLED,   /* SET_PWNHUB_ENABLED 0|1 */
+    IPC_CMD_DEDUCT_SPIRIT,        /* DEDUCT_SPIRIT amount */
+    IPC_CMD_GET_SPIRIT,           /* GET_SPIRIT - query current spirit % */
 } ipc_cmd_t;
 
 /*

@@ -21,6 +21,15 @@
 #include "gps.h"
 #include "ap_database.h"
 #include "hash_sync.h"
+#include "eapol_monitor.h"
+#include "firmware_health.h"
+#include "mobility_mode.h"
+#include "channel_map.h"
+#include "rssi_trend.h"
+#include "ap_triage.h"
+#include "driving_mode.h"
+#include "stationary_mode.h"
+#include "walking_mode.h"
 
 /* ============================================================================
  * Constants
@@ -65,6 +74,20 @@ typedef enum {
     MOOD_GRATEFUL,
     MOOD_SLEEPING,
     MOOD_REBOOTING,
+
+    /* === NEW: Mode-specific moods (Phase 2.5) === */
+    MOOD_DRIVING,         /* Driving mode active — PMKID spray */
+    MOOD_WALKING,         /* Walking mode active — opportunistic */
+    MOOD_HUNTING,         /* Stationary active attack — carpet bomb */
+    MOOD_SOAKING,         /* Stationary passive soak — listening */
+    MOOD_COOLDOWN,        /* Firmware needs rest */
+
+    /* === NEW: Action-specific moods (temporary, 5-10s) === */
+    MOOD_JACKPOT,         /* Proximity alert — strong new AP */
+    MOOD_PWNED,           /* Just captured a handshake */
+    MOOD_SCANNING,        /* Active recon sweep */
+    MOOD_SYNCING,         /* Federation sync / data transfer */
+
     MOOD_NUM_MOODS
 } brain_mood_t;
 
@@ -203,6 +226,7 @@ typedef struct {
     float atk_beta[BRAIN_NUM_ATTACK_PHASES];  /* Failure counts per phase */
     int last_attack_phase;      /* Last phase used on this AP */
     bool is_wpa3;               /* Encryption-aware routing (#10) */
+    rssi_trend_tracker_t rssi_trend;  /* Phase 1E: RSSI trend tracking */
 } brain_attack_tracker_t;
 
 /* Blacklist entry: AP that resists all deauths */
@@ -221,6 +245,8 @@ typedef struct {
     
     /* Current state */
     brain_mood_t mood;
+    brain_mood_t mood_override;       /* Temporary mood (JACKPOT/PWNED/SYNCING) */
+    time_t mood_override_expires;     /* When temporary mood ends (0=none) */
     brain_frustration_t frustration;  /* WHY we're sad/angry */
     brain_epoch_t epoch;
     
@@ -271,7 +297,7 @@ typedef struct {
     /* Thread control */
     pthread_t thread;
     pthread_mutex_t lock;
-    bool running;
+    volatile bool running;
     bool started;
     
     /* Callbacks for UI integration */
@@ -301,7 +327,7 @@ typedef struct {
     int last_ap_count;              /* Previous epoch AP count */
 
     /* Manual mode (custom button toggle) */
-    bool manual_mode;              /* true = manual (attacks paused) */
+    volatile bool manual_mode;              /* true = manual (attacks paused) */
     time_t manual_mode_toggled;    /* When mode was last changed */
 
     /* Home mode (#12) */
@@ -320,6 +346,20 @@ typedef struct {
     int  tx_power_current;              /* Current TX power in dBm */
     bool geo_fence_active;              /* Currently inside geo-fence? */
     time_t last_mac_rotation;           /* Timestamp of last MAC rotation */
+
+    /* Phase 1A: Real-time EAPOL handshake monitor */
+    eapol_monitor_t eapol_mon;           /* Live EAPOL frame capture */
+
+    /* Phase 1B: Firmware health & injection rate limiter */
+    fw_health_t fw_health;               /* BCM43438 injection rate limiter */
+
+    /* Phase 1C: Mobility mode detection (Driving/Walking/Stationary) */
+    mobility_ctx_t mobility_ctx;          /* Mobility mode detector */
+    channel_map_t channel_map;            /* Phase 1D: yield-scored channel batching */
+    ap_triage_batch_t triage;             /* Phase 2A: AP classification tiers */
+    drv_ctx_t driving;                    /* Phase 2B: Driving mode pipeline */
+    stat_ctx_t stationary;                /* Phase 2C: Stationary mode pipeline */
+    walk_ctx_t walking;                   /* Phase 2D: Walking mode pipeline */
 } brain_ctx_t;
 
 /* ============================================================================

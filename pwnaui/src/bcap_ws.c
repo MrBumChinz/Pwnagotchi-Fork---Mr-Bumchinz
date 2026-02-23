@@ -133,6 +133,9 @@ struct bcap_ws_ctx {
     pthread_t service_thread;
     volatile bool running;
     volatile bool thread_started;
+
+    /* Freeze/thaw: pause service thread during bettercap SIGSTOP */
+    volatile bool frozen;
 };
 
 /* State name helper for logging */
@@ -950,6 +953,12 @@ static void* service_thread_func(void *arg) {
     printf("[bcap_ws] Service thread started\n");
     
     while (ctx->running) {
+        /* When frozen, sleep and do nothing — bettercap is SIGSTOP'd */
+        if (ctx->frozen) {
+            usleep(200000);
+            continue;
+        }
+
         pthread_mutex_lock(&ctx->state_lock);
         bcap_state_t state = ctx->state;
         pthread_mutex_unlock(&ctx->state_lock);
@@ -1152,6 +1161,7 @@ void bcap_disconnect(bcap_ws_ctx_t *ctx) {
     if (!ctx) return;
     
     ctx->running = false;
+    ctx->frozen = false;  /* Unblock service thread so it can exit */
     
     if (ctx->thread_started) {
         pthread_join(ctx->service_thread, NULL);
@@ -1171,6 +1181,57 @@ void bcap_disconnect(bcap_ws_ctx_t *ctx) {
     if (ctx->config.on_state_change) {
         ctx->config.on_state_change(false, ctx->config.user_data);
     }
+}
+
+/* Forward declaration — defined in REST API section below */
+void bcap_close_http(void);
+
+void bcap_freeze(bcap_ws_ctx_t *ctx) {
+    if (!ctx) return;
+
+    fprintf(stderr, "[bcap_ws] FREEZE - closing connections before bettercap SIGSTOP\n");
+
+    /* 1. Tell service thread to stop touching sockets */
+    ctx->frozen = true;
+    usleep(300000);  /* Let service thread finish current iteration */
+
+    /* 2. Close WebSocket cleanly */
+    if (ctx->sock_fd >= 0) {
+        close(ctx->sock_fd);
+        ctx->sock_fd = -1;
+    }
+
+    /* 3. Close persistent REST socket (declared later as static, accessed via helper) */
+    bcap_close_http();
+
+    /* 4. Mark state as disconnected (service thread won't reconnect while frozen) */
+    pthread_mutex_lock(&ctx->state_lock);
+    ctx->state = BCAP_STATE_DISCONNECTED;
+    pthread_mutex_unlock(&ctx->state_lock);
+
+    fprintf(stderr, "[bcap_ws] FREEZE complete - sockets closed\n");
+}
+
+void bcap_thaw(bcap_ws_ctx_t *ctx) {
+    if (!ctx) return;
+
+    fprintf(stderr, "[bcap_ws] THAW - reconnecting to bettercap\n");
+
+    /* Reset sync state so we do a fresh full sync after reconnect */
+    ctx->last_full_sync = 0;
+    ctx->initial_sync_done = false;
+
+    /* Reset heartbeat timers */
+    ctx->last_ping_sent = time(NULL);
+    ctx->last_pong_recv = time(NULL);
+    ctx->awaiting_pong = false;
+    ctx->reconnect_count = 0;
+
+    /* Unfreeze — service thread will detect DISCONNECTED + auto_reconnect
+     * and start reconnecting to bettercap */
+    ctx->frozen = false;
+
+    fprintf(stderr, "[bcap_ws] THAW complete - service thread will reconnect\n");
 }
 
 bool bcap_is_connected(bcap_ws_ctx_t *ctx) {
@@ -1222,6 +1283,14 @@ int bcap_subscribe(bcap_ws_ctx_t *ctx, const char *stream) {
 
 static int g_http_fd = -1;        /* Persistent REST API socket */
 static time_t g_http_last_use = 0; /* Last successful use time */
+
+/* Close persistent REST socket — called by bcap_freeze() */
+void bcap_close_http(void) {
+    if (g_http_fd >= 0) {
+        close(g_http_fd);
+        g_http_fd = -1;
+    }
+}
 
 /* Open/reuse persistent connection to bettercap REST API */
 static int http_ensure_connected(const char *host, int port) {

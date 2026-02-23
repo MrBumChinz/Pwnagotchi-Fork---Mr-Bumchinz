@@ -250,8 +250,17 @@ static void epd_send_data_burst(const uint8_t *data, size_t len) {
 }
 
 static void epd_wait_busy(void) {
-    while (gpio_read(EPD_BUSY_PIN) == 1) {
+    int timeout = 500;  /* 5 seconds max (500 * 10ms) */
+    while (gpio_read(EPD_BUSY_PIN) == 1 && timeout-- > 0) {
         usleep(10000);
+    }
+    if (timeout <= 0) {
+        fprintf(stderr, "[display] WARNING: EPD busy timeout! Forcing reset.\n");
+        /* Hardware reset to recover */
+        gpio_write(EPD_RST_PIN, 0);
+        usleep(200000);
+        gpio_write(EPD_RST_PIN, 1);
+        usleep(200000);
     }
     usleep(10000);
 }
@@ -482,10 +491,16 @@ static void epd_display_2in13_v4(const uint8_t *image, int partial) {
     
     if (partial) {
         /* V4 Partial refresh - exact sequence from Waveshare Python driver */
-        /* Quick reset pulse */
-        gpio_write(EPD_RST_PIN, 0);
-        usleep(1000);
+        /* Reset pulse - must match Python driver timing */
         gpio_write(EPD_RST_PIN, 1);
+        usleep(20000);
+        gpio_write(EPD_RST_PIN, 0);
+        usleep(2000);
+        gpio_write(EPD_RST_PIN, 1);
+        usleep(20000);
+        
+        /* CRITICAL: Wait for controller to be ready after reset */
+        epd_wait_busy();
         
         epd_send_command(0x3C);  /* Border waveform */
         epd_send_data(0x80);

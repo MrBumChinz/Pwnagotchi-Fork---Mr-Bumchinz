@@ -24,7 +24,8 @@ typedef struct {
     char aps[32];            /* APS count string (current visible) */
     char uptime[32];         /* Uptime string */
     char shakes[32];         /* Handshakes string (legacy, unused) */
-    char mode[16];           /* Mode (AUTO/MANU/AI) */
+    char mode[16];           /* Mode (AUTO/MANU) */
+    char mobility[8];        /* Mobility state (DRV/WLK/STA/SOK/CDN) */
 
     /* Bottom bar stats - totals from persisted data */
     int pwds;                /* Passwords cracked */
@@ -44,9 +45,10 @@ typedef struct {
 
     /* PwnHub Stats widgets (pet system) */
     int pwnhub_enabled;      /* 0 = hide, 1 = show PwnHub stats */
-    int pwnhub_protein;      /* Protein macro (0-50) */
-    int pwnhub_fat;          /* Fat macro (0-50) */
-    int pwnhub_carbs;        /* Carbs macro (0-50) */
+    int pwnhub_food;         /* Food stat (0-100%) */
+    int pwnhub_strength;     /* Strength stat (0-100%) */
+    int pwnhub_spirit;       /* Spirit stat (0-100%) */
+    int spirit_deduct;        /* Pending spirit deduction from battles */
     int pwnhub_xp_percent;   /* XP progress to next level (0-100) */
     int pwnhub_level;        /* Current level */
     int pwnhub_wins;         /* Battle wins */

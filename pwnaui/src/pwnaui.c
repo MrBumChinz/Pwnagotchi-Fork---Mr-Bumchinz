@@ -127,19 +127,21 @@ static brain_ctx_t *g_brain_ctx = NULL;
 static int g_webserver_fd = -1;
 static pisugar_ctx_t *g_pisugar = NULL;  /* PiSugar button handler */
 static health_state_t g_health;
+static int g_boot_phase = 1;  /* 1 = booting (only STARTING/READY), 0 = running */
+static time_t g_boot_phase_start = 0;  /* When boot phase started */
+#define BOOT_PHASE_TIMEOUT_SECS 45  /* Max time to show coffee before fallback */
 
 /* Uptime tracking (independent of brain epochs) */
 static time_t g_start_time = 0;
 static time_t g_last_uptime_update = 0;
 static time_t g_last_stats_scan = 0;
 
+
+
 /* Convert brain mood enum to string */
 static const char *brain_mood_str(brain_mood_t mood) {
-    static const char *mood_names[] = {
-        "starting", "ready", "normal", "bored", "sad",
-        "angry", "lonely", "excited", "grateful", "sleeping", "rebooting"
-    };
-    if (mood >= 0 && mood < MOOD_NUM_MOODS) return mood_names[mood];
+    /* Must match brain_mood_t enum order exactly */
+    if (mood >= 0 && mood < MOOD_NUM_MOODS) return brain_mood_names[mood];
     return "unknown";
 }
 
@@ -178,7 +180,8 @@ static void pwnaui_log(int priority, const char *fmt, ...) {
  * ========================================================================== */
 
 
-/* Face PNG state for each mood - DIRECT PNG MAPPING */
+/* Face PNG state for each mood - DIRECT PNG MAPPING
+ * MUST match brain_mood_t enum order in brain.h exactly! */
 static const face_state_t MOOD_FACE_STATES[] = {
     FACE_EXCITED,       /* MOOD_STARTING - waking up! */
     FACE_COOL,          /* MOOD_READY - ready to play */
@@ -191,6 +194,17 @@ static const face_state_t MOOD_FACE_STATES[] = {
     FACE_FRIEND,        /* MOOD_GRATEFUL - friends! */
     FACE_SLEEP1,        /* MOOD_SLEEPING - zzz */
     FACE_BROKEN,        /* MOOD_REBOOTING - dying */
+    /* Phase 2.5: Mode-specific moods */
+    FACE_COOL,          /* MOOD_DRIVING - cruising */
+    FACE_LOOK_R_HAPPY,  /* MOOD_WALKING - out for a stroll */
+    FACE_INTENSE,       /* MOOD_HUNTING - locked on target */
+    FACE_LOOK_R,        /* MOOD_SOAKING - passive listening */
+    FACE_SLEEP1,        /* MOOD_COOLDOWN - resting firmware */
+    /* Action-specific moods */
+    FACE_LOOK_R_HAPPY,  /* MOOD_JACKPOT - found strong AP */
+    FACE_HAPPY,         /* MOOD_PWNED - captured handshake */
+    FACE_LOOK_R,        /* MOOD_SCANNING - recon sweep */
+    FACE_COOL,          /* MOOD_SYNCING - data transfer */
 };
 
 /* Get face state for mood - returns PNG enum directly */
@@ -211,7 +225,7 @@ static const char *VOICE_STARTING[] = {
 };
 
 static const char *VOICE_READY[] = {
-    "Ahhh... now we're ready to play.",
+    "Ahhh... that's better! Let's get to work.",
     NULL
 };
 
@@ -300,6 +314,53 @@ static const char *VOICE_REBOOTING[] = {
     NULL
 };
 
+/* Phase 2.5: Mode-specific voices */
+static const char *VOICE_DRIVING[] = {
+    "Vroom vroom! Spraying PMKIDs at everything we pass!",
+    NULL
+};
+
+static const char *VOICE_WALKING[] = {
+    "Nice stroll~ Let's see what pops up along the way.",
+    NULL
+};
+
+static const char *VOICE_HUNTING[] = {
+    "Locked on target. Carpet-bombing this spot!",
+    NULL
+};
+
+static const char *VOICE_SOAKING[] = {
+    "Shhh... just listening. Patience pays off.",
+    NULL
+};
+
+static const char *VOICE_COOLDOWN_MSG[] = {
+    "Firmware needs a breather... cooling down.",
+    NULL
+};
+
+/* Action-specific moods */
+static const char *VOICE_JACKPOT[] = {
+    "Jackpot! Strong new AP right here!",
+    NULL
+};
+
+static const char *VOICE_PWNED[] = {
+    "Got one! Another handshake in the bag!",
+    NULL
+};
+
+static const char *VOICE_SCANNING_MSG[] = {
+    "Scanning the area... mapping everything out.",
+    NULL
+};
+
+static const char *VOICE_SYNCING_MSG[] = {
+    "Syncing data with the mothership...",
+    NULL
+};
+
 static const char **VOICE_MESSAGES[] = {
     VOICE_STARTING,
     VOICE_READY,
@@ -311,7 +372,18 @@ static const char **VOICE_MESSAGES[] = {
     VOICE_EXCITED,
     VOICE_GRATEFUL,
     VOICE_SLEEPING,
-    VOICE_REBOOTING
+    VOICE_REBOOTING,
+    /* Phase 2.5: Mode-specific */
+    VOICE_DRIVING,
+    VOICE_WALKING,
+    VOICE_HUNTING,
+    VOICE_SOAKING,
+    VOICE_COOLDOWN_MSG,
+    /* Action-specific */
+    VOICE_JACKPOT,
+    VOICE_PWNED,
+    VOICE_SCANNING_MSG,
+    VOICE_SYNCING_MSG,
 };
 
 /* Action-specific voices */
@@ -727,6 +799,24 @@ static void brain_mood_callback(brain_mood_t mood, void *user_data) {
     const char *voice;
     face_state_t face_state = get_face_state_for_mood(mood);
 
+    /* Boot phase guard: only STARTING and READY can display during boot.
+     * Coffee message stays on screen until "Ahhh that's better" — nothing
+     * else is allowed to stomp it. MOOD_READY clears the boot phase.
+     * SAFETY: If brain never fires READY (e.g. bettercap down), timeout
+     * after 45s so the display isn't stuck on coffee forever. */
+    if (g_boot_phase) {
+        if (mood == MOOD_READY) {
+            g_boot_phase = 0;  /* Boot complete — all moods allowed now */
+        } else if (g_boot_phase_start > 0 &&
+                   time(NULL) - g_boot_phase_start > BOOT_PHASE_TIMEOUT_SECS) {
+            g_boot_phase = 0;  /* Timeout — brain failed, allow moods */
+            fprintf(stderr, "[boot] boot phase timeout after %ds, allowing moods\n",
+                    BOOT_PHASE_TIMEOUT_SECS);
+        } else if (mood != MOOD_STARTING) {
+            return;  /* Block everything else during boot */
+        }
+    }
+
     /* Context-aware messages for SAD/ANGRY */
     if ((mood == MOOD_SAD || mood == MOOD_ANGRY) && g_brain_ctx) {
         brain_frustration_t reason = brain_get_frustration(g_brain_ctx);
@@ -751,7 +841,22 @@ static void brain_mood_callback(brain_mood_t mood, void *user_data) {
     }
 
     strncpy(g_ui_state.status, voice, sizeof(g_ui_state.status) - 1);
-    
+
+    /* Update mobility label from brain's physical mobility detection.
+     * SOK/CDN are tactical sub-states (stationary but soaking/cooling).
+     * For all other moods, read the actual physical state from brain. */
+    if (mood == MOOD_SOAKING) {
+        strncpy(g_ui_state.mobility, "SOK", sizeof(g_ui_state.mobility) - 1);
+    } else if (mood == MOOD_COOLDOWN) {
+        strncpy(g_ui_state.mobility, "CDN", sizeof(g_ui_state.mobility) - 1);
+    } else if (g_brain_ctx) {
+        const char *mob = mobility_mode_label(
+            mobility_mode_get(&g_brain_ctx->mobility_ctx));
+        strncpy(g_ui_state.mobility, mob, sizeof(g_ui_state.mobility) - 1);
+    } else {
+        strncpy(g_ui_state.mobility, "STA", sizeof(g_ui_state.mobility) - 1);
+    }
+
     /* Start/stop animations based on mood */
     if (mood == MOOD_NORMAL || mood == MOOD_STARTING) {
         animation_start(ANIM_LOOK, 2500);
@@ -840,28 +945,10 @@ static void brain_epoch_callback(int epoch_num, const brain_epoch_t *data, void 
         if (food < 0) food = 0;
         if (food > FOOD_MAX) food = FOOD_MAX;
 
-        /* Map food level to macro icons:
-         *   >66% (>660) = all 3 icons (protein + fat + carbs)
-         *   33-66% (330-660) = 2 icons (protein + fat)
-         *   1-33% (1-329) = 1 icon (protein only)
-         *   0 = no icons */
-        if (food > 660) {
-            g_ui_state.pwnhub_protein = 50;
-            g_ui_state.pwnhub_fat = 50;
-            g_ui_state.pwnhub_carbs = 50;
-        } else if (food >= 330) {
-            g_ui_state.pwnhub_protein = 50;
-            g_ui_state.pwnhub_fat = 50;
-            g_ui_state.pwnhub_carbs = 0;
-        } else if (food >= 1) {
-            g_ui_state.pwnhub_protein = 50;
-            g_ui_state.pwnhub_fat = 0;
-            g_ui_state.pwnhub_carbs = 0;
-        } else {
-            g_ui_state.pwnhub_protein = 0;
-            g_ui_state.pwnhub_fat = 0;
-            g_ui_state.pwnhub_carbs = 0;
-        }
+        /* Map food (0-1000) to percentage (0-100) for icon display */
+        int food_pct = (food * 100) / FOOD_MAX;
+        if (food_pct > 100) food_pct = 100;
+        g_ui_state.pwnhub_food = food_pct;
 
         /* Log food every epoch so we can see what's actually happening */
         {
@@ -960,7 +1047,19 @@ static void brain_epoch_callback(int epoch_num, const brain_epoch_t *data, void 
         else if (level >= 5) strncpy(g_ui_state.pwnhub_title, "Newborn", 23);
         else strncpy(g_ui_state.pwnhub_title, "Hatchling", 23);
     }
-    
+
+    /* Update mobility label from physical detection every epoch (30s).
+     * This is the ground truth — ensures label is always correct even
+     * if mood transitions miss or get blocked by boot guard. */
+    if (g_brain_ctx) {
+        const char *mob = mobility_mode_label(
+            mobility_mode_get(&g_brain_ctx->mobility_ctx));
+        strncpy(g_ui_state.mobility, mob, sizeof(g_ui_state.mobility) - 1);
+        g_ui_state.mobility[sizeof(g_ui_state.mobility) - 1] = '\0';
+        fprintf(stderr, "[epoch] mobility=%s (mode=%d)\n", mob,
+                (int)mobility_mode_get(&g_brain_ctx->mobility_ctx));
+    }
+
     g_dirty = 1;
     pthread_mutex_unlock(&g_ui_mutex);
 
@@ -1164,6 +1263,9 @@ static void setup_signals(void) {
     /* Ignore SIGPIPE - handle write errors explicitly */
     sa.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &sa, NULL);
+
+    /* Auto-reap forked children */
+    sigaction(SIGCHLD, &sa, NULL);
 }
 
 /*
@@ -1216,7 +1318,7 @@ static void webserver_state_cb(char *buf, size_t bufsize) {
         g_ui_state.battery, g_ui_state.gps,
         g_ui_state.pwds, g_ui_state.fhs, g_ui_state.phs, g_ui_state.tcaps,
         g_ui_state.memtemp_data,
-        g_ui_state.pwnhub_enabled, g_ui_state.pwnhub_protein, g_ui_state.pwnhub_fat, g_ui_state.pwnhub_carbs,
+        g_ui_state.pwnhub_enabled, g_ui_state.pwnhub_food, g_ui_state.pwnhub_strength, g_ui_state.pwnhub_spirit,
         g_ui_state.pwnhub_xp_percent, g_ui_state.pwnhub_level, g_ui_state.pwnhub_title,
         g_ui_state.pwnhub_wins, g_ui_state.pwnhub_battles);
     pthread_mutex_unlock(&g_ui_mutex);
@@ -1228,24 +1330,27 @@ static void init_ui_state(void) {
     
     /* Default values matching Pwnagotchi layout */
     strncpy(g_ui_state.name, "pwnagotchi>", sizeof(g_ui_state.name) - 1);
-    g_ui_state.face_enum = FACE_LOOK_R;  /* Initial state - looking */
-    strncpy(g_ui_state.status, "Waking up...", sizeof(g_ui_state.status) - 1);
+    g_ui_state.face_enum = FACE_EXCITED;  /* Boot face - getting coffee! */
+    strncpy(g_ui_state.status, "Coffee time! Wake up, wake up!", sizeof(g_ui_state.status) - 1);
     strncpy(g_ui_state.channel, "00", sizeof(g_ui_state.channel) - 1);
     strncpy(g_ui_state.aps, "0", sizeof(g_ui_state.aps) - 1);
     strncpy(g_ui_state.uptime, "00:00:00:00", sizeof(g_ui_state.uptime) - 1);
     strncpy(g_ui_state.shakes, "0", sizeof(g_ui_state.shakes) - 1);
-    strncpy(g_ui_state.mode, "MANU", sizeof(g_ui_state.mode) - 1);
-    strncpy(g_ui_state.status, "Initializing...", sizeof(g_ui_state.status) - 1);
+    strncpy(g_ui_state.mode, "AUTO", sizeof(g_ui_state.mode) - 1);
+    strncpy(g_ui_state.mobility, "STA", sizeof(g_ui_state.mobility) - 1);
     strncpy(g_ui_state.bluetooth, "BT-", sizeof(g_ui_state.bluetooth) - 1);
     strncpy(g_ui_state.gps, "GPS-", sizeof(g_ui_state.gps) - 1);
+    
+    g_boot_phase = 1;
+    g_boot_phase_start = time(NULL);
     
     g_ui_state.invert = 0;
     
     /* PwnHub defaults - enabled by default */
     g_ui_state.pwnhub_enabled = 1;
-    g_ui_state.pwnhub_protein = 0;
-    g_ui_state.pwnhub_fat = 0;
-    g_ui_state.pwnhub_carbs = 0;
+    g_ui_state.pwnhub_food = 0;
+    g_ui_state.pwnhub_strength = 0;
+    g_ui_state.pwnhub_spirit = 0;
     /* Load persisted XP/level immediately so display is correct from boot */
     {
         int saved_xp = 0;
@@ -1532,18 +1637,18 @@ static int handle_command(const char *cmd, char *response, size_t resp_size) {
         return -1;
     }
     
-    /* SET_PWNHUB_MACROS protein fat carbs - Set macro values (0-50 each) */
+    /* SET_PWNHUB_MACROS food strength spirit - Set stat values (0-100 each) */
     if (strcmp(cmd_name, "SET_PWNHUB_MACROS") == 0) {
-        int protein, fat, carbs;
-        if (sscanf(cmd, "SET_PWNHUB_MACROS %d %d %d", &protein, &fat, &carbs) == 3) {
-            g_ui_state.pwnhub_protein = (protein < 0) ? 0 : (protein > 50) ? 50 : protein;
-            g_ui_state.pwnhub_fat = (fat < 0) ? 0 : (fat > 50) ? 50 : fat;
-            g_ui_state.pwnhub_carbs = (carbs < 0) ? 0 : (carbs > 50) ? 50 : carbs;
+        int food, strength, spirit;
+        if (sscanf(cmd, "SET_PWNHUB_MACROS %d %d %d", &food, &strength, &spirit) == 3) {
+            g_ui_state.pwnhub_food = (food < 0) ? 0 : (food > 100) ? 100 : food;
+            g_ui_state.pwnhub_strength = (strength < 0) ? 0 : (strength > 100) ? 100 : strength;
+            g_ui_state.pwnhub_spirit = (spirit < 0) ? 0 : (spirit > 100) ? 100 : spirit;
             g_dirty = 1;
             snprintf(response, resp_size, "OK\n");
             return 0;
         }
-        snprintf(response, resp_size, "ERR Invalid SET_PWNHUB_MACROS params (need: protein fat carbs)\n");
+        snprintf(response, resp_size, "ERR Invalid SET_PWNHUB_MACROS params (need: food strength spirit)\n");
         return -1;
     }
     
@@ -1669,10 +1774,10 @@ static int handle_command(const char *cmd, char *response, size_t resp_size) {
     /* GET_STATE - Return current UI state (for debugging) */
     if (strcmp(cmd_name, "GET_STATE") == 0) {
         snprintf(response, resp_size, 
-            "OK face=%s status=%s ch=%s aps=%s up=%s shakes=%s mode=%s name=%s bt=%s memtemp=%s pwds=%d fhs=%d phs=%d tcaps=%d\n",
+            "OK face=%s status=%s ch=%s aps=%s up=%s shakes=%s mode=%s mobility=%s name=%s bt=%s memtemp=%s pwds=%d fhs=%d phs=%d tcaps=%d\n",
             g_ui_state.face, g_ui_state.status, g_ui_state.channel,
             g_ui_state.aps, g_ui_state.uptime, g_ui_state.shakes,
-            g_ui_state.mode, g_ui_state.name, g_ui_state.bluetooth,
+            g_ui_state.mode, g_ui_state.mobility, g_ui_state.name, g_ui_state.bluetooth,
             g_ui_state.memtemp_data, g_ui_state.pwds, g_ui_state.fhs, g_ui_state.phs, g_ui_state.tcaps);
         return 0;
     }
@@ -1927,17 +2032,6 @@ static void usage(const char *prog) {
 /*
  * Main entry point
  */
-/* PiSugar mode change callback - updates brain's manual_mode */
-static void on_mode_change_cb(pwnagotchi_mode_t new_mode, void *user_data) {
-    (void)user_data;
-    
-    if (g_brain_ctx) {
-        g_brain_ctx->manual_mode = (new_mode == MODE_MANUAL);
-        g_brain_ctx->manual_mode_toggled = time(NULL);
-    }
-}
-
-
 int main(int argc, char *argv[]) {
     int opt;
     const char *socket_path = SOCKET_PATH;
@@ -2180,12 +2274,14 @@ int main(int argc, char *argv[]) {
                 brain_channel_callback,  /* on_channel_change */
                 NULL);                   /* user_data */
             g_brain_ctx->on_attack_phase = brain_attack_phase_callback;
-
-            /* Default boot mode is MANUAL - tell brain to pause attacks */
-            g_brain_ctx->manual_mode = true;
-            g_brain_ctx->manual_mode_toggled = time(NULL);
-            PWNAUI_LOG_INFO("Brain: manual_mode=true (boot default)");
             
+            /* Set initial manual_mode from pisugar mode file */
+            if (g_pisugar) {
+                g_brain_ctx->manual_mode = (pisugar_get_mode(g_pisugar) == MODE_MANUAL);
+                PWNAUI_LOG_INFO("Brain initial manual_mode = %s",
+                                g_brain_ctx->manual_mode ? "true" : "false");
+            }
+
             if (brain_start(g_brain_ctx) == 0) {
                 PWNAUI_LOG_INFO("Thompson Sampling brain started - replacing Python pwnagotchi!");
 
@@ -2202,8 +2298,7 @@ int main(int argc, char *argv[]) {
     /* Initialize PiSugar button handler */
     g_pisugar = pisugar_init();
     if (g_pisugar) {
-        PWNAUI_LOG_INFO("PiSugar3 initialized - custom btn: tap=mode, 2x=reserved, hold=reserved");
-        pisugar_set_callback(g_pisugar, on_mode_change_cb, NULL);
+        PWNAUI_LOG_INFO("PiSugar initialized - double tap to toggle mode");
     } else {
         PWNAUI_LOG_INFO("PiSugar not detected (optional)");
     }
@@ -2220,14 +2315,17 @@ int main(int argc, char *argv[]) {
                 PWNAUI_LOG_ERR("Failed to start brain thread");
                 brain_destroy(g_brain_ctx);
                 g_brain_ctx = NULL;
+                g_boot_phase = 0;  /* Brain dead, let moods through */
             }
         } else {
             PWNAUI_LOG_ERR("Failed to create brain context");
             g_brain_enabled = 0;
+            g_boot_phase = 0;  /* No brain, let moods through */
         }
     } else if (g_brain_enabled) {
         PWNAUI_LOG_WARN("Brain requires bettercap - disabling brain");
         g_brain_enabled = 0;
+        g_boot_phase = 0;  /* No brain, let moods through */
     }
 
     /* Create IPC server */
@@ -2294,6 +2392,24 @@ int main(int argc, char *argv[]) {
             /* TODO: Implement config reload */
             g_reload_config = 0;
         }
+
+        /* Boot phase timeout: if brain never connected, clear coffee message
+         * and show a normal status so display isn't stuck forever. */
+        if (g_boot_phase && g_boot_phase_start > 0 &&
+            time(NULL) - g_boot_phase_start > BOOT_PHASE_TIMEOUT_SECS) {
+            g_boot_phase = 0;
+            pthread_mutex_lock(&g_ui_mutex);
+            strncpy(g_ui_state.status, "Ahhh... that's better! Let's get to work.",
+                    sizeof(g_ui_state.status) - 1);
+            g_ui_state.face_enum = FACE_COOL;
+            strncpy(g_ui_state.face, g_face_state_names[FACE_COOL],
+                    sizeof(g_ui_state.face) - 1);
+            animation_stop();
+            g_dirty = 1;
+            pthread_mutex_unlock(&g_ui_mutex);
+            PWNAUI_LOG_WARN("[boot] Boot phase timeout (%ds) - brain may not have connected",
+                            BOOT_PHASE_TIMEOUT_SECS);
+        }
         
         /* Setup select */
         FD_ZERO(&read_fds);
@@ -2328,30 +2444,30 @@ int main(int argc, char *argv[]) {
             }
         }
         
-        /* Poll PiSugar3 custom button (reg 0x08 bit 0) - runs every loop (~10ms) */
+        /* Poll PiSugar for button taps — runs every main loop iteration (~10ms)
+         * so the tap state machine can properly detect short/single/double/long */
         if (g_pisugar) {
             pisugar_tap_t tap = pisugar_poll_tap(g_pisugar);
-            switch (tap) {
-            case TAP_SINGLE:
+            if (tap == TAP_SINGLE || tap == TAP_DOUBLE) {
+                PWNAUI_LOG_INFO("PiSugar %s - toggling mode",
+                                tap == TAP_SINGLE ? "SINGLE TAP" : "DOUBLE TAP");
                 pisugar_toggle_mode(g_pisugar);
-                if (pisugar_get_mode(g_pisugar) == MODE_MANUAL) {
-                    strncpy(g_ui_state.mode, "MANU", sizeof(g_ui_state.mode) - 1);
-                    PWNAUI_LOG_INFO("MODE -> MANUAL");
-                } else {
-                    strncpy(g_ui_state.mode, "AUTO", sizeof(g_ui_state.mode) - 1);
-                    PWNAUI_LOG_INFO("MODE -> AUTO");
-                }
+
+                /* Update mode label only — don't touch status/voice */
+                pwnagotchi_mode_t new_mode = pisugar_get_mode(g_pisugar);
+                const char *mode_str = (new_mode == MODE_AUTO) ? "AUTO" : "MANU";
+                pthread_mutex_lock(&g_ui_mutex);
+                strncpy(g_ui_state.mode, mode_str, sizeof(g_ui_state.mode) - 1);
                 g_dirty = 1;
-                break;
-            case TAP_DOUBLE:
-                PWNAUI_LOG_INFO("DOUBLE TAP - reserved");
-                break;
-            case TAP_LONG:
-                PWNAUI_LOG_INFO("LONG PRESS - reserved");
-                break;
-            case TAP_NONE:
-            default:
-                break;
+                pthread_mutex_unlock(&g_ui_mutex);
+
+                /* Tell the brain thread to pause/resume autonomous attacks */
+                if (g_brain_ctx) {
+                    g_brain_ctx->manual_mode = (new_mode == MODE_MANUAL);
+                    g_brain_ctx->manual_mode_toggled = time(NULL);
+                    PWNAUI_LOG_INFO("Brain manual_mode = %s",
+                                    g_brain_ctx->manual_mode ? "true" : "false");
+                }
             }
         }
 

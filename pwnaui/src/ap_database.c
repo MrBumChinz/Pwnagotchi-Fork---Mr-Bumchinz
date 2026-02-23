@@ -198,6 +198,19 @@ int ap_db_set_thompson(const char *bssid, float alpha, float beta) {
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
+int ap_db_set_clients(const char *bssid, int clients_seen) {
+    if (!g_db || !bssid) return -1;
+    static const char *SQL =
+        "UPDATE aps SET clients_seen=? WHERE bssid=?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(g_db, SQL, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(stmt, 1, clients_seen);
+    sqlite3_bind_text(stmt, 2, bssid, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
 int ap_db_record_attack(const char *bssid, int phase) {
     if (!g_db || !bssid) return -1;
     static const char *SQL =

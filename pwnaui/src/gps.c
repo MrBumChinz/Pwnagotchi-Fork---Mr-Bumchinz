@@ -25,6 +25,27 @@
 
 #include "gps.h"
 
+/* Speed computation from GPGGA position deltas (1Hz) */
+#include <math.h>
+/* Sliding window of GPS positions for accurate speed calculation.
+ * Using 5 positions (~5s at 1Hz) averages out jitter while responding
+ * quickly to real movement changes. */
+#define GPS_POS_WINDOW 5
+static struct {
+    double lat, lon;
+    uint64_t ms;
+} _pos_ring[GPS_POS_WINDOW];
+static int _pos_ring_idx = 0;
+static int _pos_ring_count = 0;
+
+static double _gps_haversine(double lat1, double lon1, double lat2, double lon2) {
+    double dlat = (lat2 - lat1) * M_PI / 180.0;
+    double dlon = (lon2 - lon1) * M_PI / 180.0;
+    double a = sin(dlat/2)*sin(dlat/2) +
+               cos(lat1*M_PI/180.0)*cos(lat2*M_PI/180.0)*sin(dlon/2)*sin(dlon/2);
+    return 6371000.0 * 2.0 * atan2(sqrt(a), sqrt(1.0-a));
+}
+
 /* Timeout for marking GPS as disconnected (ms) */
 #define GPS_TIMEOUT_MS          5000
 
@@ -430,6 +451,48 @@ int plugin_gps_handle_data(gps_data_t *data) {
     int parsed = 0;
     if (strncmp(buffer, "$GPGGA", 6) == 0) {
         parsed = nmea_parse_gpgga(buffer, data);
+        /* Compute speed from sliding window of GPGGA positions.
+         * Uses oldest→newest position over ~5 seconds for accurate
+         * average speed that naturally dampens GPS jitter. */
+        if (parsed && data->has_fix && data->latitude != 0.0) {
+            uint64_t now_ms = data->last_nmea_ms;
+
+            /* Add current position to ring buffer */
+            _pos_ring[_pos_ring_idx].lat = data->latitude;
+            _pos_ring[_pos_ring_idx].lon = data->longitude;
+            _pos_ring[_pos_ring_idx].ms = now_ms;
+            _pos_ring_idx = (_pos_ring_idx + 1) % GPS_POS_WINDOW;
+            if (_pos_ring_count < GPS_POS_WINDOW) _pos_ring_count++;
+
+            /* Compute speed from oldest→newest position in window */
+            if (_pos_ring_count >= 2) {
+                int oldest_idx = (_pos_ring_count < GPS_POS_WINDOW)
+                    ? 0
+                    : _pos_ring_idx;  /* ring has wrapped */
+                int newest_idx = (_pos_ring_idx + GPS_POS_WINDOW - 1) % GPS_POS_WINDOW;
+
+                double dt_s = (double)(
+                    _pos_ring[newest_idx].ms - _pos_ring[oldest_idx].ms
+                ) / 1000.0;
+
+                if (dt_s > 0.5) {  /* Need at least 0.5s span */
+                    double dist_m = _gps_haversine(
+                        _pos_ring[oldest_idx].lat, _pos_ring[oldest_idx].lon,
+                        _pos_ring[newest_idx].lat, _pos_ring[newest_idx].lon
+                    );
+
+                    /* Minimum distance threshold: GPS jitter is typically
+                     * 2-5m CEP. Over 5 seconds, jitter accumulates to ~8m.
+                     * Below this, report 0 speed to avoid phantom movement. */
+                    if (dist_m < 8.0 && dt_s < 6.0) {
+                        data->speed_kmh = 0.0;
+                    } else {
+                        data->speed_kmh = (dist_m / dt_s) * 3.6;
+                    }
+                    data->speed_knots = data->speed_kmh / 1.852;
+                }
+            }
+        }
     } else if (strncmp(buffer, "$GPVTG", 6) == 0) {
         parsed = nmea_parse_gpvtg(buffer, data);
     } else if (strncmp(buffer, "$GPRMC", 6) == 0) {

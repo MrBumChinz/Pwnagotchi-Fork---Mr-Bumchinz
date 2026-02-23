@@ -58,6 +58,8 @@
 #define TAP_DOUBLE_GAP_MS    400    /* Max gap between taps for double-tap */
 #define TAP_LONG_THRESH_MS  2500    /* Min hold for long press (>2s avoids 1s-poll misdetect) */
 #define TAP_DEBOUNCE_MS       50    /* Debounce time */
+#define VIBRATION_FILTER_MS  300    /* Ignore events within 300ms of last tap (walking vibration) */
+#define MODE_COOLDOWN_MS    1500    /* Min time between mode toggles (prevents accidental double-switch) */
 
 /* Tap result types */
 typedef enum {
@@ -104,6 +106,8 @@ typedef struct {
     uint64_t btn_release_time;      /* When button was released (ms) */
     int btn_last_raw;               /* Last raw button reading (debounce) */
     uint64_t btn_last_change;       /* Last state change time (debounce) */
+    uint64_t btn_last_tap_done_ms;  /* When last tap cycle completed (vibration filter) */
+    uint64_t last_mode_switch_ms;   /* Cooldown: last mode toggle timestamp */
 
     /* Callback for mode change */
     void (*on_mode_change)(pwnagotchi_mode_t new_mode, void *user_data);

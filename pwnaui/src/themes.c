@@ -711,6 +711,9 @@ void animation_tick(uint32_t now_ms) {
         case ANIM_DOWNLOAD:
             max_frame = UPLOAD_FRAME_COUNT;
             break;
+        case ANIM_DOZE:
+            max_frame = SLEEP_FRAME_COUNT;  /* SLEEP1/SLEEP2 ping-pong */
+            break;
         default:
             return;
     }
@@ -730,6 +733,8 @@ face_state_t animation_get_frame(void) {
             return upload_frames[g_anim_state.frame % UPLOAD_FRAME_COUNT];
         case ANIM_DOWNLOAD:
             return download_frames[g_anim_state.frame % DOWNLOAD_FRAME_COUNT];
+        case ANIM_DOZE:
+            return sleep_frames[g_anim_state.frame % SLEEP_FRAME_COUNT];
         default:
             return FACE_HAPPY;
     }

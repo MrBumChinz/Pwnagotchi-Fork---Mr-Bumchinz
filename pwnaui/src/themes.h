@@ -64,7 +64,8 @@ typedef enum {
     ANIM_LOOK_HAPPY,  /* Alternate LOOK_L_HAPPY <-> LOOK_R_HAPPY */
     ANIM_SLEEP,       /* Cycle SLEEP1->2->3->4->3->2->1 */
     ANIM_UPLOAD,      /* Cycle 00->01->11->10 (binary counter) */
-    ANIM_DOWNLOAD     /* Cycle 11->10->00->01 (reverse binary) */
+    ANIM_DOWNLOAD,    /* Cycle 11->10->00->01 (reverse binary) */
+    ANIM_DOZE         /* Slow SLEEP1/SLEEP2 ping-pong for cooldown */
 } animation_type_t;
 
 /* Animation state */

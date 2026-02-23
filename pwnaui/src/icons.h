@@ -25,11 +25,23 @@ typedef struct {
     int loaded;             /* 1 if successfully loaded */
 } png_icon_t;
 
-/* Macro icon indices */
-#define MACRO_ICON_PROTEIN  0
-#define MACRO_ICON_FAT      1
-#define MACRO_ICON_CARBS    2
-#define MACRO_ICON_COUNT    3
+/* Stat icon indices */
+#define STAT_ICON_FOOD      0
+#define STAT_ICON_STRENGTH  1
+#define STAT_ICON_SPIRIT    2
+#define STAT_ICON_COUNT     3
+
+/* Fill levels per stat */
+#define FOOD_FILL_LEVELS     4   /* 10, 40, 75, 100 */
+#define STRENGTH_FILL_LEVELS 4   /* 10, 40, 75, 100 */
+#define SPIRIT_FILL_LEVELS   5   /* 10, 25, 50, 75, 100 */
+#define MAX_FILL_LEVELS      5   /* Maximum across all stats */
+
+/* Legacy aliases for backward compatibility */
+#define MACRO_ICON_PROTEIN  STAT_ICON_FOOD
+#define MACRO_ICON_FAT      STAT_ICON_STRENGTH
+#define MACRO_ICON_CARBS    STAT_ICON_SPIRIT
+#define MACRO_ICON_COUNT    STAT_ICON_COUNT
 
 /*
  * Initialize icon system (loads PNG macro icons)
@@ -62,33 +74,52 @@ int icons_count(void);
 void icons_draw(uint8_t *framebuffer, const char *name, int x, int y);
 
 /*
- * Get macro icon by index (MACRO_ICON_PROTEIN, etc.)
+ * Get stat icon for a given stat at a given fill percentage.
+ * Returns the closest fill-level PNG for that stat.
+ * stat_index: STAT_ICON_FOOD, STAT_ICON_STRENGTH, or STAT_ICON_SPIRIT
+ * fill_percent: 0-100
  */
+const png_icon_t *icons_get_stat(int stat_index, int fill_percent);
+
+/* Legacy accessor (returns 100% fill icon) */
 const png_icon_t *icons_get_macro(int index);
 
 /*
- * Draw macro icon to framebuffer
+ * Draw a stat icon (with fill level) to framebuffer
  * Returns 0 on success, -1 if icon not loaded
  */
-int icons_draw_macro(uint8_t *framebuffer, int fb_width, int fb_height,
-                     int icon_index, int x, int y, int invert);
+int icons_draw_stat(uint8_t *framebuffer, int fb_width, int fb_height,
+                    int stat_index, int fill_percent, int x, int y, int invert);
 
 /*
- * Draw macro icon scaled to specific dimensions
- * Returns 0 on success, -1 if icon not loaded
+ * Draw a stat icon scaled to specific dimensions
  */
+int icons_draw_stat_scaled(uint8_t *framebuffer, int fb_width, int fb_height,
+                           int stat_index, int fill_percent, int x, int y,
+                           int dst_w, int dst_h, int invert);
+
+/* Legacy draw functions (use 100% fill) */
+int icons_draw_macro(uint8_t *framebuffer, int fb_width, int fb_height,
+                     int icon_index, int x, int y, int invert);
 int icons_draw_macro_scaled(uint8_t *framebuffer, int fb_width, int fb_height,
                             int icon_index, int x, int y,
                             int dst_w, int dst_h, int invert);
 
 /*
- * Draw macro icons based on overall macro percentage
- * Shows 3/2/1/0 icons based on fill level, with flashing at <10%
- * 
- * macro_percent: Average macro fill (0-100)
+ * Draw all 3 stat icons (Food, Strength, Spirit) with individual fill levels.
+ * Always shows all 3 icons; each at its own fill-level PNG.
+ * Flashes any icon whose fill_percent < 10.
+ *
+ * food_pct, strength_pct, spirit_pct: 0-100 fill for each stat
  * flash_state: 0 or 1 for flashing toggle (caller tracks timing)
  */
-void icons_draw_macro_indicator(uint8_t *framebuffer, int fb_width, int fb_height,
-                                int x, int y, int macro_percent, int flash_state, int invert);
+void icons_draw_stat_indicators(uint8_t *framebuffer, int fb_width, int fb_height,
+                                int x, int y,
+                                int food_pct, int strength_pct, int spirit_pct,
+                                int flash_state, int invert);
+
+/* Legacy name */
+#define icons_draw_macro_indicator(fb, w, h, x, y, pct, flash, inv) \
+    icons_draw_stat_indicators(fb, w, h, x, y, pct, pct, pct, flash, inv)
 
 #endif /* PWNAUI_ICONS_H */

@@ -207,6 +207,20 @@ int bcap_connect_async(bcap_ws_ctx_t *ctx);
 void bcap_disconnect(bcap_ws_ctx_t *ctx);
 
 /**
+ * Freeze bettercap connection before SIGSTOP.
+ * Closes WebSocket and REST sockets cleanly so the service thread
+ * stops hitting a frozen bettercap process. Call BEFORE killall -STOP.
+ */
+void bcap_freeze(bcap_ws_ctx_t *ctx);
+
+/**
+ * Thaw bettercap connection after SIGCONT.
+ * Re-establishes WebSocket and REST connections.
+ * Call AFTER killall -CONT + a short delay for bettercap to wake up.
+ */
+void bcap_thaw(bcap_ws_ctx_t *ctx);
+
+/**
  * Check if connected
  */
 bool bcap_is_connected(bcap_ws_ctx_t *ctx);

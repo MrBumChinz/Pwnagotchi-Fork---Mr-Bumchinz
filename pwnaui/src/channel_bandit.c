@@ -98,3 +98,50 @@ void cb_update_stats(cb_bandit_t *cb, int channel, int ap_count) {
     cb->channels[channel].last_visited = time(NULL);
     cb->current_channel = channel;
 }
+
+
+/* ============================================================================
+ * Persistence: Save/Load channel bandit state
+ * ========================================================================== */
+
+#define CB_STATE_MAGIC 0x43425354  /* "CBST" */
+#define CB_STATE_PATH "/etc/pwnagotchi/channel_bandit_state.bin"
+
+int cb_save(const cb_bandit_t *cb) {
+    FILE *f = fopen(CB_STATE_PATH, "wb");
+    if (!f) return -1;
+
+    uint32_t magic = CB_STATE_MAGIC;
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(cb, sizeof(cb_bandit_t), 1, f);
+    fclose(f);
+    return 0;
+}
+
+int cb_load(cb_bandit_t *cb) {
+    FILE *f = fopen(CB_STATE_PATH, "rb");
+    if (!f) return -1;
+
+    uint32_t magic;
+    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != CB_STATE_MAGIC) {
+        fclose(f);
+        return -1;
+    }
+
+    cb_bandit_t tmp;
+    if (fread(&tmp, sizeof(cb_bandit_t), 1, f) != 1) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    /* Sanity check: channel 1 must have valid alpha/beta */
+    if (tmp.channels[1].alpha < 0.1f || tmp.channels[1].beta < 0.1f) {
+        fprintf(stderr, "[channel_bandit] Corrupt state file, using fresh init\n");
+        return -1;
+    }
+
+    *cb = tmp;
+    fprintf(stderr, "[channel_bandit] Loaded state from %s\n", CB_STATE_PATH);
+    return 0;
+}
