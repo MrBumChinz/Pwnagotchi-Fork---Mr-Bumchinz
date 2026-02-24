@@ -33,8 +33,8 @@
 #define MOB_GPS_HYSTERESIS      1      /* GPS-confirmed: instant (Doppler is reliable at 1Hz) */
 
 /* GPS speed thresholds (km/h) */
-#define MOB_SPEED_DRIVING       15.0    /* > 15 km/h = driving */
-#define MOB_SPEED_WALKING        1.5    /* 1.5-15 km/h = walking (was 2.0, missed slow walks) */
+#define MOB_SPEED_DRIVING       10.0    /* > 10 km/h = driving (was 15, too high for suburban) */
+#define MOB_SPEED_WALKING        1.5    /* 1.5-10 km/h = walking */
                                         /* < 1.5 km/h = stationary */
 
 /* Speed smoothing: EMA alpha (higher = more reactive)
@@ -42,6 +42,7 @@
  * Doppler speed is already filtered by the receiver chip. */
 #define MOB_SPEED_SMOOTH_ALPHA  0.9f   /* Near-instant tracking: 1 reading to converge */
 #define MOB_SPEED_MAX_SANE      120.0f  /* Reject GPS > 120 km/h as noise */
+#define MOB_GPS_HOLDOVER_S      30      /* Use last GPS speed for up to 30s after dropout */
 #define MOB_SWITCH_COOLDOWN_S   5       /* Min 5s between mode switches (was 8) */
 
 /* AP churn thresholds (fraction of total APs changed per check) */
@@ -121,6 +122,7 @@ typedef struct {
 
     /* Timestamps */
     time_t last_check;                  /* Last update_mobility call */
+    time_t last_valid_gps;              /* Last time GPS speed was >= 0 */
     time_t mode_since;                  /* When current mode was entered */
     time_t session_start;               /* When monitoring started */
 

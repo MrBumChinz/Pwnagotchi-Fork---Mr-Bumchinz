@@ -73,14 +73,12 @@ static const mobility_params_t MODE_PARAMS[MOBILITY_MODE_COUNT] = {
  * Classify inputs into a mobility mode.
  *
  * GPS Doppler speed is the PRIMARY and AUTHORITATIVE signal.
- * When GPS has a fix, its speed reading vetoes AP churn:
- *   - speed > 15 = DRIVING
+ * When GPS has a fix (or holdover from recent fix), speed determines mode:
+ *   - speed > 10 = DRIVING
  *   - speed > 1.5 = WALKING 
  *   - speed <= 1.5 = STATIONARY (churn CANNOT override)
  *
- * AP churn is ONLY used when there is NO GPS fix (speed < 0).
- * Churn from scan variance (3→5→3 APs at home) caused constant
- * false WALKING with the old logic that let churn override GPS.
+ * AP churn is ONLY used when there is NO GPS fix AND no holdover.
  */
 static mobility_mode_t classify(float gps_speed, float mob_score, float ap_churn, int total_aps) {
     /* GPS Doppler is available (>= 0) — trust it absolutely */
@@ -120,6 +118,7 @@ int mobility_mode_init(mobility_ctx_t *ctx) {
     ctx->pending_mode = MOBILITY_STATIONARY;
     ctx->pending_count = 0;
     ctx->smoothed_speed = -1.0f;  /* No valid GPS yet */
+    ctx->last_valid_gps = 0;       /* No GPS received yet */
     ctx->session_start = time(NULL);
     ctx->mode_since = ctx->session_start;
     ctx->last_check = ctx->session_start;
@@ -156,13 +155,16 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
         gps_speed = -1.0f;  /* Treat as no-GPS for this reading */
     }
 
-    /* Asymmetric EMA speed smoothing:
+    /* Asymmetric EMA speed smoothing + GPS holdover:
      * - Upward (accelerating): use MOB_SPEED_SMOOTH_ALPHA (0.9) — fast but dampens spikes
      * - Downward (decelerating): snap immediately to raw speed.
-     *   When GPS Doppler says 0, the user STOPPED. Don't let the EMA
-     *   ghost at 8+ km/h for several readings causing false WLK. */
+     * - GPS dropout (raw=-1.0): use last smoothed speed for up to 30s,
+     *   decaying 15% per reading to gradually return to stationary.
+     *   BT GPS drops for 10-16s regularly; without holdover, every dropout
+     *   causes WLK->STA->WLK oscillation. */
     float smoothed = gps_speed;
     if (gps_speed >= 0.0f) {
+        ctx->last_valid_gps = now;
         if (ctx->smoothed_speed < 0.0f) {
             /* First valid GPS reading — seed EMA */
             ctx->smoothed_speed = gps_speed;
@@ -175,6 +177,18 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
                                 + (1.0f - MOB_SPEED_SMOOTH_ALPHA) * ctx->smoothed_speed;
         }
         smoothed = ctx->smoothed_speed;
+    } else if (ctx->smoothed_speed >= 0.0f && ctx->last_valid_gps > 0 &&
+               (now - ctx->last_valid_gps) < MOB_GPS_HOLDOVER_S) {
+        /* GPS dropped but we had a recent fix — use holdover.
+         * Decay smoothed speed 15% per call so we don't hold a stale
+         * high speed forever if GPS truly dies. */
+        ctx->smoothed_speed *= 0.85f;
+        if (ctx->smoothed_speed < 0.5f) ctx->smoothed_speed = 0.0f;
+        smoothed = ctx->smoothed_speed;
+    } else {
+        /* No GPS fix and no recent holdover — truly no GPS */
+        smoothed = -1.0f;
+        ctx->smoothed_speed = -1.0f;
     }
 
     /* Use smoothed speed for classification, not raw */

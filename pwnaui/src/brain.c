@@ -102,7 +102,7 @@ static void brain_eapol_callback(const uint8_t *bssid,
 
 static void update_mobility(brain_ctx_t *ctx) {
     time_t now = time(NULL);
-    if (now - ctx->last_mobility_check < 15) return;  /* Max once per 15s */
+    if (now - ctx->last_mobility_check < 2) return;  /* Check every 2s (GPS arrives at 1Hz) */
     ctx->last_mobility_check = now;
 
     float gps_component = 0.0f;
@@ -122,54 +122,55 @@ static void update_mobility(brain_ctx_t *ctx) {
         ctx->last_lon = ctx->gps->longitude;
     }
 
-    /* AP churn detection (works without GPS) */
+    /* AP churn detection (works without GPS).
+     * NOTE: ap_delta = abs(count_now - count_prev) only detects COUNT changes,
+     * not actual AP TURNOVER (where old APs leave and new ones arrive but total
+     * stays the same). This is a known limitation; proper fix needs BSSID set
+     * tracking. For now, we EMA-smooth the raw churn to prevent wild oscillation
+     * that prevents hysteresis from ever triggering WALKING mode. */
     int ap_delta = abs(ctx->total_aps - ctx->last_ap_count);
     ctx->last_ap_count = ctx->total_aps;
     if (ap_delta >= 5) ap_component = 1.0f;
     else if (ap_delta >= 2) ap_component = (float)(ap_delta - 1) / 4.0f;
 
-    /* Combined score with exponential moving average */
+    /* Combined score with fast-tracking EMA (alpha=0.7 for input, instant GPS response) */
     float raw_score = fmaxf(gps_component, ap_component);
-    ctx->mobility_score = ctx->mobility_score * 0.7f + raw_score * 0.3f;
+    ctx->mobility_score = ctx->mobility_score * 0.3f + raw_score * 0.7f;
+
+    /* EMA-smoothed AP churn fraction for mobility_mode_update().
+     * Raw per-epoch churn oscillates wildly (0.55 → 0.08 → 0.31) because
+     * walking adds APs gradually, not all at once. Smoothing prevents the
+     * hysteresis counter from resetting every other epoch. */
+    static float smoothed_churn = 0.0f;
+    {
+        float raw_churn = (ctx->total_aps > 0) ? (float)ap_delta / (float)ctx->total_aps : 0.0f;
+        if (raw_churn > 1.0f) raw_churn = 1.0f;
+        smoothed_churn = 0.7f * raw_churn + 0.3f * smoothed_churn;
+    }
 
     if (ctx->mobility_score > 0.3f) {
         fprintf(stderr, "[brain] [mobility] score=%.2f (gps=%.2f, ap_churn=%.2f, aps=%d)\n",
                 ctx->mobility_score, gps_component, ap_component, ctx->total_aps);
     }
 
-    /* Suppress mode detection for first 30s after boot (churn from 0→N is misleading) */
-    static int mobility_boot_skips = 2;  /* Skip first 2 checks (30s at 15s interval) */
+    /* Suppress mode detection for first few seconds after boot (churn from 0→N is misleading) */
+    static int mobility_boot_skips = 1;  /* Skip first check only (2s at 2s interval) */
     if (mobility_boot_skips > 0) {
         mobility_boot_skips--;
         fprintf(stderr, "[brain] [mobility-dbg] BOOT GRACE: skipping mode detection (%d left)\n", mobility_boot_skips);
         return;
     }
 
-    /* Debug: always log mobility inputs for troubleshooting */
-    fprintf(stderr, "[brain] [mobility-dbg] raw=%.1f smooth=%.1fkm/h score=%.2f churn=%.2f(delta=%d/aps=%d) mode=%s\n",
-            (ctx->gps && ctx->gps->has_fix) ? (float)ctx->gps->speed_kmh : -1.0f,
-            ctx->mobility_ctx.smoothed_speed >= 0 ? ctx->mobility_ctx.smoothed_speed : -1.0f,
-            ctx->mobility_score, 
-            (ctx->total_aps > 0) ? (float)ap_delta / (float)ctx->total_aps : 0.0f,
-            ap_delta, ctx->total_aps,
-            mobility_mode_label(ctx->mobility_ctx.current_mode));
-
     /* Phase 1C: Feed data to mobility mode detector for DRV/WLK/STA switching.
-     * GPS speed_kmh is the primary signal; mobility_score + ap_churn are fallbacks.
-     * This was missing — mobility_mode_update() was never called, so the mode
-     * was stuck on STATIONARY forever. */
+     * GPS speed_kmh is the primary signal; mobility_score + ap_churn are fallbacks. */
     float gps_speed_kmh = -1.0f;  /* -1 = no GPS; classify() uses >= 0 as "GPS present" */
     if (ctx->gps && ctx->gps->has_fix) {
         gps_speed_kmh = (float)ctx->gps->speed_kmh;
     }
-    /* Compute AP churn as fraction (0.0-1.0) for fallback when GPS unavailable */
-    float ap_churn_frac = 0.0f;
-    if (ctx->total_aps > 0) {
-        ap_churn_frac = (float)ap_delta / (float)ctx->total_aps;
-        if (ap_churn_frac > 1.0f) ap_churn_frac = 1.0f;
-    }
+    /* Use smoothed AP churn, not raw per-epoch delta.
+     * Raw churn oscillates too wildly for hysteresis to work. */
     if (mobility_mode_update(&ctx->mobility_ctx, gps_speed_kmh,
-                             ctx->mobility_score, ap_churn_frac, ctx->total_aps)) {
+                             ctx->mobility_score, smoothed_churn, ctx->total_aps)) {
         /* Mode changed — apply new parameters to brain config */
         const mobility_params_t *p = mobility_mode_get_params(&ctx->mobility_ctx);
         ctx->config.recon_time = p->recon_time;
@@ -196,6 +197,19 @@ static void update_mobility(brain_ctx_t *ctx) {
                 p->pmkid_only ? "PMKID-ONLY" : "ALL",
                 p->deauth_enabled, p->associate_enabled);
 
+        /* Immediately update display mood to reflect new mobility mode.
+         * Without this, the display only updates on the next epoch (30-70s).
+         * Walking/driving detection should be visible within seconds. */
+        if (ctx->on_mood_change) {
+            brain_mood_t mob_mood;
+            switch (ctx->mobility_ctx.current_mode) {
+                case MOBILITY_DRIVING: mob_mood = MOOD_DRIVING; break;
+                case MOBILITY_WALKING: mob_mood = MOOD_WALKING; break;
+                default:               mob_mood = MOOD_SCANNING; break;
+            }
+            ctx->on_mood_change(mob_mood, ctx->callback_user_data);
+        }
+
         /* Phase 2: Start/stop mode-specific pipeline sessions on transition */
         switch (ctx->mobility_ctx.current_mode) {
             case MOBILITY_DRIVING:
@@ -216,6 +230,16 @@ static void update_mobility(brain_ctx_t *ctx) {
                 break;
         }
     }
+
+    /* Debug: always log mobility inputs AFTER update (so smoothed_speed is current) */
+    fprintf(stderr, "[brain] [mobility-dbg] raw=%.1f smooth=%.1fkm/h score=%.2f churn=%.2f(s=%.2f delta=%d/aps=%d) mode=%s\n",
+            gps_speed_kmh,
+            ctx->mobility_ctx.smoothed_speed,
+            ctx->mobility_score, 
+            smoothed_churn,
+            (ctx->total_aps > 0) ? (float)ap_delta / (float)ctx->total_aps : 0.0f,
+            ap_delta, ctx->total_aps,
+            mobility_mode_label(ctx->mobility_ctx.current_mode));
 }
 
 /* RSSI-proportional delay multiplier (#16).
@@ -1753,6 +1777,8 @@ static void *brain_thread_func(void *arg) {
             }
 
             usleep(ctx->config.recon_time * 1000000);
+            /* Mobility check during blind mode idle */
+            update_mobility(ctx);
             continue;
         }
         
@@ -1784,7 +1810,11 @@ static void *brain_thread_func(void *arg) {
                     !crack_mgr_exhausted(ctx->crack_mgr)) {
                     crack_mgr_start(ctx->crack_mgr);
                 }
-                sleep(30);
+                /* Sleep 30s in 2s chunks so mobility stays responsive */
+                for (int _hs = 0; _hs < 15 && ctx->running; _hs++) {
+                    sleep(2);
+                    update_mobility(ctx);
+                }
                 brain_epoch_next(ctx);
                 brain_update_mood(ctx);
                 continue;  /* Skip to next epoch */
@@ -1808,7 +1838,11 @@ static void *brain_thread_func(void *arg) {
                     }
                     ap_db_export_json(NULL);
                 }
-                sleep(30);
+                /* Sleep 30s in 2s chunks so mobility stays responsive */
+                for (int _h2s = 0; _h2s < 15 && ctx->running; _h2s++) {
+                    sleep(2);
+                    update_mobility(ctx);
+                }
                 continue;
             }
         } else if (!check_home2_network(ctx)) {
