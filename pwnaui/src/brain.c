@@ -2370,7 +2370,7 @@ static void *brain_thread_func(void *arg) {
                             float _ta = ap_tracker->atk_alpha[attack_phase];
                             float _tb = ap_tracker->atk_beta[attack_phase];
                             _ml_ext.thompson_ratio = (_ta + _tb > 0) ? _ta / (_ta + _tb) : 0.5f;
-                            _ml_ext.has_pmkid = (_hs_q == HS_QUALITY_PMKID) ? 1.0f : 0.0f;
+                            _ml_ext.has_pmkid = (get_handshake_quality(mac_str) == HS_QUALITY_PMKID) ? 1.0f : 0.0f;
                             _ml_ext.is_wpa3 = is_wpa3 ? 1.0f : 0.0f;
                             int _ml_phase = predict_attack_phase(&_ml_ext);
                             if (_ml_phase >= 0 && _ml_phase < BRAIN_NUM_ATTACK_PHASES &&
