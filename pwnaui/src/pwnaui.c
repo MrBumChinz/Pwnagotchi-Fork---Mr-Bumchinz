@@ -129,7 +129,7 @@ static pisugar_ctx_t *g_pisugar = NULL;  /* PiSugar button handler */
 static health_state_t g_health;
 static int g_boot_phase = 1;  /* 1 = booting (only STARTING/READY), 0 = running */
 static time_t g_boot_phase_start = 0;  /* When boot phase started */
-#define BOOT_PHASE_TIMEOUT_SECS 45  /* Max time to show coffee before fallback */
+#define BOOT_PHASE_TIMEOUT_SECS 120  /* Max time to show coffee before fallback (Pi Zero W needs ~90s) */
 
 /* Uptime tracking (independent of brain epochs) */
 static time_t g_start_time = 0;

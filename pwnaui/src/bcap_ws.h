@@ -28,7 +28,7 @@ extern "C" {
 #define BCAP_MAX_URL_LEN        256
 #define BCAP_MAX_USER_LEN       64
 #define BCAP_MAX_PASS_LEN       64
-#define BCAP_RECONNECT_DELAY_MS 5000
+#define BCAP_RECONNECT_DELAY_MS 2000
 #define BCAP_HEARTBEAT_MS       30000
 #define BCAP_RX_BUFFER_SIZE     65536
 #define BCAP_MAX_APS            256

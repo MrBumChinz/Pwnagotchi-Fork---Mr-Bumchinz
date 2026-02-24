@@ -71,33 +71,36 @@ static const mobility_params_t MODE_PARAMS[MOBILITY_MODE_COUNT] = {
 
 /**
  * Classify inputs into a mobility mode.
- * GPS speed is primary signal; AP churn is fallback when speed is 0 (no fix).
+ *
+ * GPS speed is primary signal when it's clearly moving.
+ * When GPS speed is near-zero, AP churn acts as a tiebreaker —
+ * haversine position-differencing can't resolve walking speed
+ * (~5 km/h) from GPS jitter (~5m CEP), so "speed=0" doesn't
+ * necessarily mean stationary.
  */
 static mobility_mode_t classify(float gps_speed, float mob_score, float ap_churn) {
-    /* GPS speed >= 0 means we have a GPS fix.
-     * GPS speed < 0 means no GPS fix -- use AP churn as fallback.
-     * When GPS says stationary (speed=0), trust it over AP churn. */
-
-    if (gps_speed >= 0.0f) {
-        /* We have GPS -- it's authoritative */
-        if (gps_speed > MOB_SPEED_DRIVING) {
-            return MOBILITY_DRIVING;
-        }
-        if (gps_speed > MOB_SPEED_WALKING) {
-            return MOBILITY_WALKING;
-        }
-        /* GPS says not moving fast enough for walking */
-        return MOBILITY_STATIONARY;
+    /* GPS clearly says driving — trust it unconditionally */
+    if (gps_speed > MOB_SPEED_DRIVING) {
+        return MOBILITY_DRIVING;
     }
 
-    /* No GPS fix -- fall back to AP churn / mobility_score.
-     * These are much noisier, so use higher thresholds. */
+    /* GPS clearly says walking speed — trust it */
+    if (gps_speed > MOB_SPEED_WALKING) {
+        return MOBILITY_WALKING;
+    }
+
+    /* GPS speed is low or missing. AP churn can override.
+     * This handles both:
+     *   (a) GPS has fix but speed=0.0 (haversine can't detect walking)
+     *   (b) No GPS fix (speed < 0)  */
     if (ap_churn > MOB_CHURN_DRIVING && mob_score > 0.5f) {
         return MOBILITY_DRIVING;
     }
-    if (ap_churn > MOB_CHURN_WALKING && mob_score > 0.2f) {
+    if (ap_churn > MOB_CHURN_WALKING && mob_score > 0.15f) {
         return MOBILITY_WALKING;
     }
+
+    /* Both GPS and AP churn agree: not moving */
     return MOBILITY_STATIONARY;
 }
 

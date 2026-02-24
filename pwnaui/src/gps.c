@@ -37,7 +37,17 @@ static struct {
 } _pos_ring[GPS_POS_WINDOW];
 static int _pos_ring_idx = 0;
 static int _pos_ring_count = 0;
-static bool _gpgga_speed_valid = false;  /* True when GPGGA haversine speed is computed */
+
+/* Speed source tracking: VTG/RMC Doppler speed is authoritative for low speeds
+ * (walking). Haversine position-differencing is only a fallback because consumer
+ * GPS positions don't update fast enough to detect walking (~5m CEP). */
+static uint64_t _last_vtg_speed_ms = 0;  /* Timestamp of last VTG/RMC speed update */
+#define GPS_VTG_STALE_MS  10000           /* Use haversine if no VTG in 10 seconds */
+
+/* NMEA sentence counters for diagnostics */
+static uint32_t _nmea_gga_count = 0;
+static uint32_t _nmea_vtg_count = 0;
+static uint32_t _nmea_rmc_count = 0;
 
 static double _gps_haversine(double lat1, double lon1, double lat2, double lon2) {
     double dlat = (lat2 - lat1) * M_PI / 180.0;
@@ -362,12 +372,13 @@ int nmea_parse_gpvtg(const char *sentence, gps_data_t *data) {
     
     if (parsed >= 7) {
         data->bearing = bearing;
-        /* Only use GPVTG speed if GPGGA haversine hasn't computed one.
-         * GPGGA haversine is much more stable than raw NMEA speed. */
-        if (!_gpgga_speed_valid) {
-            data->speed_knots = speed_knots;
-            data->speed_kmh = speed_kmh;
-        }
+        /* VTG Doppler speed is authoritative — it detects walking speed
+         * accurately via carrier frequency shift, unlike haversine which
+         * can't resolve ~7m walking distance vs ~5m GPS CEP jitter. */
+        data->speed_knots = speed_knots;
+        data->speed_kmh = speed_kmh;
+        _last_vtg_speed_ms = data->last_nmea_ms;
+        _nmea_vtg_count++;
         return 1;
     }
     
@@ -400,12 +411,11 @@ int nmea_parse_gprmc(const char *sentence, gps_data_t *data) {
     if (parsed >= 6 && status == 'A') {
         data->latitude = nmea_parse_coord(lat_str, lat_dir);
         data->longitude = nmea_parse_coord(lon_str, lon_dir);
-        /* Only use GPRMC speed if GPGGA haversine hasn't computed one.
-         * Raw NMEA speed-over-ground is very noisy from phone GPS. */
-        if (!_gpgga_speed_valid) {
-            data->speed_knots = speed_knots;
-            data->speed_kmh = speed_knots * 1.852;
-        }
+        /* RMC Doppler speed is authoritative (same as VTG). */
+        data->speed_knots = speed_knots;
+        data->speed_kmh = speed_knots * 1.852;
+        _last_vtg_speed_ms = data->last_nmea_ms;
+        _nmea_rmc_count++;
         data->bearing = bearing;
         data->has_fix = true;
         return 1;
@@ -463,9 +473,12 @@ int plugin_gps_handle_data(gps_data_t *data) {
     int parsed = 0;
     if (strncmp(buffer, "$GPGGA", 6) == 0) {
         parsed = nmea_parse_gpgga(buffer, data);
-        /* Compute speed from sliding window of GPGGA positions.
-         * Uses oldest→newest position over ~5 seconds for accurate
-         * average speed that naturally dampens GPS jitter. */
+        _nmea_gga_count++;
+
+        /* Haversine speed from position differencing — FALLBACK ONLY.
+         * Only used when no VTG/RMC Doppler speed has arrived recently.
+         * Consumer GPS positions have ~5m CEP which cannot reliably
+         * resolve walking distance (~7m in 5s) from jitter. */
         if (parsed && data->has_fix && data->latitude != 0.0) {
             uint64_t now_ms = data->last_nmea_ms;
 
@@ -476,35 +489,38 @@ int plugin_gps_handle_data(gps_data_t *data) {
             _pos_ring_idx = (_pos_ring_idx + 1) % GPS_POS_WINDOW;
             if (_pos_ring_count < GPS_POS_WINDOW) _pos_ring_count++;
 
-            /* Compute speed from oldest→newest position in window */
-            if (_pos_ring_count >= 2) {
+            /* Only compute haversine speed if no VTG/RMC in last 10s */
+            bool vtg_stale = (now_ms - _last_vtg_speed_ms) > GPS_VTG_STALE_MS;
+            if (vtg_stale && _pos_ring_count >= 2) {
                 int oldest_idx = (_pos_ring_count < GPS_POS_WINDOW)
                     ? 0
-                    : _pos_ring_idx;  /* ring has wrapped */
+                    : _pos_ring_idx;
                 int newest_idx = (_pos_ring_idx + GPS_POS_WINDOW - 1) % GPS_POS_WINDOW;
 
                 double dt_s = (double)(
                     _pos_ring[newest_idx].ms - _pos_ring[oldest_idx].ms
                 ) / 1000.0;
 
-                if (dt_s > 0.5) {  /* Need at least 0.5s span */
+                if (dt_s > 0.5) {
                     double dist_m = _gps_haversine(
                         _pos_ring[oldest_idx].lat, _pos_ring[oldest_idx].lon,
                         _pos_ring[newest_idx].lat, _pos_ring[newest_idx].lon
                     );
-
-                    /* Minimum distance threshold: GPS jitter is typically
-                     * 2-5m CEP. Walking speed (~5 km/h) covers ~6.5m in 5s,
-                     * so the old 8m threshold filtered out walking entirely.
-                     * Use 3m floor with 3s window to detect walking. */
                     if (dist_m < 3.0 && dt_s < 3.0) {
                         data->speed_kmh = 0.0;
                     } else {
                         data->speed_kmh = (dist_m / dt_s) * 3.6;
                     }
                     data->speed_knots = data->speed_kmh / 1.852;
-                    _gpgga_speed_valid = true;  /* GPGGA haversine speed is authoritative */
                 }
+            }
+
+            /* Periodic NMEA source diagnostic (every 60 GGA sentences ~1min) */
+            if ((_nmea_gga_count % 60) == 0) {
+                fprintf(stderr, "[gps] NMEA stats: GGA=%u VTG=%u RMC=%u speed=%.1fkm/h src=%s\n",
+                        _nmea_gga_count, _nmea_vtg_count, _nmea_rmc_count,
+                        data->speed_kmh,
+                        vtg_stale ? "haversine" : "doppler");
             }
         }
     } else if (strncmp(buffer, "$GPVTG", 6) == 0) {
@@ -541,9 +557,9 @@ int plugin_gps_update(gps_data_t *data) {
         if (now - data->last_nmea_ms > GPS_TIMEOUT_MS) {
             data->status = GPS_STATUS_DISCONNECTED;
             data->has_fix = false;
-            /* Reset haversine speed flag so GPVTG/GPRMC can seed
-             * on reconnect instead of using stale ring buffer data */
-            _gpgga_speed_valid = false;
+            /* Reset position ring buffer and VTG timestamp so
+             * speed is recomputed fresh on reconnect */
+            _last_vtg_speed_ms = 0;
             _pos_ring_count = 0;
             _pos_ring_idx = 0;
             strcpy(data->display, "GPS-");

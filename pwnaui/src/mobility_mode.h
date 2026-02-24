@@ -37,10 +37,12 @@
 #define MOB_SPEED_WALKING        2.0    /* 2-15 km/h = walking */
                                         /* < 2 km/h = stationary */
 
-/* Speed smoothing: EMA alpha (lower = smoother, 0.3 = ~5 sample window) */
-#define MOB_SPEED_SMOOTH_ALPHA  0.4f   /* Smoother EMA: ~4-5 reading window */
+/* Speed smoothing: EMA alpha (higher = more reactive)
+ * At 0.7, speed responds in ~2 readings instead of ~5.
+ * Walking speed needs fast detection since walks are short. */
+#define MOB_SPEED_SMOOTH_ALPHA  0.7f   /* Reactive EMA: ~2 reading window */
 #define MOB_SPEED_MAX_SANE      120.0f  /* Reject GPS > 120 km/h as noise */
-#define MOB_SWITCH_COOLDOWN_S   15      /* Min 15s between mode switches */
+#define MOB_SWITCH_COOLDOWN_S   10      /* Min 10s between mode switches */
 
 /* AP churn thresholds (fraction of total APs changed per check) */
 #define MOB_CHURN_DRIVING        0.7    /* > 70% AP turnover = driving */

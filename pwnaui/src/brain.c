@@ -1500,16 +1500,20 @@ static void *brain_thread_func(void *arg) {
     /* Starting mood */
     brain_set_mood(ctx, MOOD_STARTING);
     
-    /* Wait for bettercap connection */
+    /* Wait for bettercap connection (up to 90s for slow Pi Zero boot).
+     * bcap_ws reconnects in background with exponential backoff (2s, 4s, 8s...)
+     * so bettercap may take 30-60s to fully start on Pi Zero W. */
     int retries = 0;
-    while (!bcap_is_connected(ctx->bcap) && retries < 30) {
+    while (!bcap_is_connected(ctx->bcap) && retries < 90) {
         usleep(1000000);  /* 1 second */
         retries++;
     }
     if (!bcap_is_connected(ctx->bcap)) {
-        fprintf(stderr, "[brain] bettercap connection timeout\n");
-        ctx->running = false;
-        return NULL;
+        fprintf(stderr, "[brain] bettercap connection timeout after %ds — entering epoch loop anyway\n", retries);
+        fprintf(stderr, "[brain] bcap_ws will keep reconnecting in background\n");
+        /* DON'T kill the brain thread — enter epoch loop and let it run.
+         * bcap_ws background thread will keep reconnecting, and the epoch
+         * loop handles a disconnected bcap gracefully (polls fail/noop). */
     }
     
     /* Push bettercap wifi settings (like JayOS _reset_wifi_settings) */
