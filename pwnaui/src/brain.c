@@ -62,6 +62,44 @@ static double haversine_distance(double lat1, double lon1, double lat2, double l
 /* Update mobility score based on GPS movement + AP churn.
  * Score: 0.0 = stationary (parked), 1.0 = fast movement (walking/driving)
  * Called once per epoch (~30s). */
+/* Forward declaration for get_attack_tracker (defined later as static) */
+static brain_attack_tracker_t *get_attack_tracker(brain_ctx_t *ctx, const char *mac);
+
+/* Phase 1A Fix: EAPOL capture callback — fires when handshake completes.
+ * Updates Thompson rewards so the brain learns which attacks work. */
+static void brain_eapol_callback(const uint8_t *bssid,
+                                  eapol_capture_type_t type,
+                                  const eapol_quality_t *quality,
+                                  void *user_data) {
+    brain_ctx_t *ctx = (brain_ctx_t *)user_data;
+    if (!ctx || !bssid) return;
+
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+
+    /* Reward Thompson sampling for this AP */
+    ts_entity_t *entity = ts_get_or_create_entity(ctx->thompson, mac_str);
+    if (entity) {
+        float reward = (quality && quality->score > 50) ? 1.0f : 0.5f;
+        ts_observe_outcome(entity, true, reward);
+        fprintf(stderr, "[brain] [eapol-cb] %s captured (type=%d score=%d) -> Thompson rewarded\n",
+                mac_str, (int)type, quality ? quality->score : 0);
+    }
+
+    /* Record in channel map */
+    brain_attack_tracker_t *tracker = get_attack_tracker(ctx, mac_str);
+    if (tracker) {
+        /* Reward the attack phase that led to this capture */
+        int phase = tracker->last_attack_phase;
+        if (phase >= 0 && phase < 8) {
+            tracker->atk_alpha[phase] += 1.0f;
+            fprintf(stderr, "[brain] [eapol-cb] Thompson phase %d rewarded for %s\n",
+                    phase, mac_str);
+        }
+    }
+}
+
 static void update_mobility(brain_ctx_t *ctx) {
     time_t now = time(NULL);
     if (now - ctx->last_mobility_check < 15) return;  /* Max once per 15s */
@@ -157,6 +195,26 @@ static void update_mobility(brain_ctx_t *ctx) {
                 p->recon_time, p->hop_recon_time, p->throttle_a, p->throttle_d,
                 p->pmkid_only ? "PMKID-ONLY" : "ALL",
                 p->deauth_enabled, p->associate_enabled);
+
+        /* Phase 2: Start/stop mode-specific pipeline sessions on transition */
+        switch (ctx->mobility_ctx.current_mode) {
+            case MOBILITY_DRIVING:
+                walk_session_end(&ctx->walking);
+                stat_session_end(&ctx->stationary);
+                drv_session_start(&ctx->driving);
+                break;
+            case MOBILITY_WALKING:
+                drv_session_end(&ctx->driving);
+                stat_session_end(&ctx->stationary);
+                walk_session_start(&ctx->walking);
+                break;
+            case MOBILITY_STATIONARY:
+            default:
+                drv_session_end(&ctx->driving);
+                walk_session_end(&ctx->walking);
+                stat_session_start(&ctx->stationary);
+                break;
+        }
     }
 }
 
@@ -1392,8 +1450,10 @@ static void *brain_thread_func(void *arg) {
 
     /* AUDIT FIX: Initialize EAPOL monitor for real-time handshake detection */
     if (eapol_monitor_init(&ctx->eapol_mon, "wlan0mon") == 0) {
+        /* Phase 1A: Register capture callback for real-time Thompson rewards */
+        eapol_monitor_set_callback(&ctx->eapol_mon, brain_eapol_callback, ctx);
         if (eapol_monitor_start(&ctx->eapol_mon) == 0) {
-            fprintf(stderr, "[brain] EAPOL monitor started\n");
+            fprintf(stderr, "[brain] EAPOL monitor started (callback registered)\n");
         } else {
             fprintf(stderr, "[brain] WARNING: EAPOL monitor start failed\n");
         }
@@ -1713,6 +1773,29 @@ static void *brain_thread_func(void *arg) {
             continue;
         }
 
+        /* Phase 1D: Rebuild channel map per-epoch with fresh AP data */
+        {
+            int _cmn = ap_count;
+            if (_cmn > 0 && _cmn <= 256) {
+                int _cch[256], _ccl[256], _crs[256];
+                bool _ccp[256];
+                for (int ai = 0; ai < _cmn; ai++) {
+                    bcap_ap_t _cma;
+                    if (bcap_get_ap(ctx->bcap, ai, &_cma) == 0) {
+                        _cch[ai] = _cma.channel;
+                        _ccl[ai] = _cma.clients_count;
+                        _crs[ai] = _cma.rssi;
+                        char _cmm[18];
+                        mac_to_str(&_cma.bssid, _cmm);
+                        _ccp[ai] = (get_handshake_quality(_cmm) == HS_QUALITY_FULL);
+                    } else {
+                        _cch[ai] = 0; _ccl[ai] = 0; _crs[ai] = -100; _ccp[ai] = false;
+                    }
+                }
+                channel_map_build(&ctx->channel_map, _cch, _ccl, _ccp, _crs, _cmn, NULL);
+            }
+        }
+
         /* Build channel list from visible APs */
         int channel_counts[256] = {0};
         int channels[BRAIN_MAX_CHANNELS];
@@ -1801,6 +1884,37 @@ static void *brain_thread_func(void *arg) {
             }
             num_channels = ordered_idx;
             
+        /* Phase 1D: Apply channel_map yield-sorted order (overrides Thompson when available) */
+        {
+            channel_attack_order_t _corder;
+            channel_map_get_attack_order(&ctx->channel_map, &_corder);
+            if (_corder.count > 0) {
+                /* Use channel_map order: channels sorted by yield score */
+                int new_count = 0;
+                for (int ci = 0; ci < _corder.count && new_count < BRAIN_MAX_CHANNELS; ci++) {
+                    /* Only include channels that were found in the scan */
+                    for (int si = 0; si < num_channels; si++) {
+                        if (channels[si] == _corder.channels[ci]) {
+                            if (new_count != si) {
+                                /* Swap into position */
+                                int tmp_ch = channels[new_count];
+                                channels[new_count] = channels[si];
+                                channels[si] = tmp_ch;
+                            }
+                            new_count++;
+                            break;
+                        }
+                    }
+                }
+                fprintf(stderr, "[brain] channel order (yield-sorted): ");
+                for (int ci = 0; ci < num_channels; ci++) {
+                    int listen = channel_map_get_listen_ms(&ctx->channel_map, channels[ci]);
+                    fprintf(stderr, "ch%d(%dms) ", channels[ci], listen);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+
         fprintf(stderr, "[brain] epoch %d: attack_phase=%s\n",
                 ctx->epoch.epoch_num,
                 (ctx->epoch.epoch_num % 8 == 0) ? "AUTH_ASSOC" :
@@ -1965,6 +2079,18 @@ static void *brain_thread_func(void *arg) {
                         if (_tri_out.tier == TRIAGE_SKIP) {
                             continue;  /* Triage says skip entirely */
                         }
+                        /* Phase 2A: Triage tier priority — Gold>Silver>Bronze>Exploit */
+                        if (entity) {
+                            float _triage_boost = 0.0f;
+                            switch (_tri_out.tier) {
+                                case TRIAGE_GOLD:    _triage_boost = 0.6f; break;
+                                case TRIAGE_SILVER:  _triage_boost = 0.3f; break;
+                                case TRIAGE_BRONZE:  _triage_boost = 0.1f; break;
+                                case TRIAGE_EXPLOIT: _triage_boost = 0.4f; break;
+                                default: break;
+                            }
+                            entity->client_boost += _triage_boost;
+                        }
                     }
 
                     /* AUDIT FIX: ML vulnerability prediction */
@@ -1989,6 +2115,31 @@ static void *brain_thread_func(void *arg) {
                         brain_set_mood(ctx, MOOD_JACKPOT);
                         fprintf(stderr, "[brain] JACKPOT! Strong AP: %s %ddBm ch%d clients=%d\n",
                                 ap.ssid, ap.rssi, ap.channel, ap.clients_count);
+                    }
+
+                    /* Phase 2D: Walking mode — proximity alerts + target tracking */
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING) {
+                        walk_update_target(&ctx->walking, mac_str, ap.ssid,
+                                          (int8_t)ap.rssi, ap.channel, ap.clients_count,
+                                          (_hs_q == HS_QUALITY_FULL));
+                        if (walk_check_proximity(&ctx->walking, mac_str, ap.ssid,
+                                                 (int8_t)ap.rssi, ap.clients_count)) {
+                            brain_set_mood(ctx, MOOD_JACKPOT);
+                            fprintf(stderr, "[brain] [walk-prox] %s\n",
+                                    walk_get_proximity_text(&ctx->walking));
+                        }
+                    }
+
+                    /* Phase 2B: Driving mode — GPS breadcrumb for every AP seen */
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING) {
+                        double _blat = 0.0, _blon = 0.0;
+                        if (ctx->gps && ctx->gps->has_fix) {
+                            _blat = ctx->gps->latitude;
+                            _blon = ctx->gps->longitude;
+                        }
+                        drv_add_breadcrumb(&ctx->driving, mac_str, ap.ssid,
+                                          (int8_t)ap.rssi, ap.channel,
+                                          _blat, _blon, false);
                     }
 
                     /* Boost score for APs with clients (better handshake targets) */
@@ -2140,6 +2291,49 @@ static void *brain_thread_func(void *arg) {
                         if (is_wpa3) {
                             fprintf(stderr, "[brain] [enc-route] %s is WPA3/SAE -> phase %d\n",
                                     ap.ssid, attack_phase);
+                        }
+                        /* Phase 5: ML attack phase prediction — boost Thompson choice */
+                        {
+                            ap_features_ext_t _ml_ext;
+                            memset(&_ml_ext, 0, sizeof(_ml_ext));
+                            _ml_ext.base.rssi_norm = ((float)ap.rssi + 100.0f) / 60.0f;
+                            _ml_ext.base.client_count_log = logf((float)ap.clients_count + 1.0f);
+                            _ml_ext.base.channel_norm = (float)ap.channel / 14.0f;
+                            _ml_ext.base.encryption_type = is_wpa3 ? 2.0f : 1.0f;
+                            float _ta = ap_tracker->atk_alpha[attack_phase];
+                            float _tb = ap_tracker->atk_beta[attack_phase];
+                            _ml_ext.thompson_ratio = (_ta + _tb > 0) ? _ta / (_ta + _tb) : 0.5f;
+                            _ml_ext.is_wpa3 = is_wpa3 ? 1.0f : 0.0f;
+                            int _ml_phase = predict_attack_phase(&_ml_ext);
+                            if (_ml_phase >= 0 && _ml_phase < BRAIN_NUM_ATTACK_PHASES &&
+                                ctx->config.attack_phase_enabled[_ml_phase]) {
+                                /* ML suggests different phase — blend: 70% Thompson, 30% ML */
+                                if (_ml_phase != attack_phase) {
+                                    /* Give ML phase a 50% boost in Thompson alpha */
+                                    ap_tracker->atk_alpha[_ml_phase] += 0.5f;
+                                }
+                            }
+                        }
+                    }
+
+                    /* Phase 1E: RSSI trend delay in walking mode — force PMKID at approach, full burst at peak */
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING && ap_tracker) {
+                        bool _has_any_hs = (get_handshake_quality(mac_str) != HS_QUALITY_NONE);
+                        if (rssi_trend_should_delay(&ap_tracker->rssi_trend, _has_any_hs)) {
+                            /* Approaching — only do PMKID association, save deauth for peak */
+                            rssi_trend_info_t _rti;
+                            rssi_trend_classify(&ap_tracker->rssi_trend, &_rti);
+                            fprintf(stderr, "[brain] [rssi-delay] %s approaching (slope=%.1f rssi=%d) -> PMKID only\n",
+                                    ap.ssid, _rti.slope, ap.rssi);
+                            attack_phase = 0;  /* Force PMKID/association only */
+                        } else {
+                            /* Apply RSSI priority multiplier to Thompson scores */
+                            float _rpri = rssi_trend_priority(&ap_tracker->rssi_trend);
+                            if (_rpri > 1.2f) {
+                                fprintf(stderr, "[brain] [rssi-peak] %s at peak (pri=%.1f) -> full burst\n",
+                                        ap.ssid, _rpri);
+                            }
+                            priority *= _rpri;
                         }
                     }
 
@@ -2383,10 +2577,11 @@ static void *brain_thread_func(void *arg) {
                 usleep(100000);  /* 100ms firmware breathing room */
             }
 
-            /* Smart dwell: only wait if we actually attacked on this channel */
+            /* Smart dwell: yield-aware listen time from channel_map (Phase 1D) */
             if (did_deauth_this_ch > 0 || did_assoc_this_ch > 0) {
-                int dwell_ms = ctx->config.hop_recon_time * 1000;
-                fprintf(stderr, "[brain] waiting %dms before hop to ch %d\n",
+                int dwell_ms = channel_map_get_listen_ms(&ctx->channel_map, ch);
+                if (dwell_ms <= 0) dwell_ms = ctx->config.hop_recon_time * 1000;
+                fprintf(stderr, "[brain] waiting %dms before hop to ch %d (yield-dwell)\n",
                         dwell_ms, (c + 1 < num_channels) ?
                         channels[c + 1] : channels[0]);
                 usleep(dwell_ms * 1000);
@@ -2432,6 +2627,12 @@ static void *brain_thread_func(void *arg) {
 
                     /* AUDIT FIX: Record capture in channel map */
                     if (w) channel_map_record_capture(&ctx->channel_map, w->channel);
+
+                    /* Phase 2: Notify mode pipeline of capture */
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING)
+                        walk_record_capture(&ctx->walking, ctx->pending_attack_mac);
+                    else if (ctx->mobility_ctx.current_mode == MOBILITY_STATIONARY)
+                        stat_record_capture(&ctx->stationary);
 
                     fprintf(stderr, "[brain] HANDSHAKE! %s rewarded (ch%d, mode=%s)\n", 
                             ctx->pending_attack_mac, 
@@ -2570,6 +2771,35 @@ static void *brain_thread_func(void *arg) {
          * Bettercap captures EAPOL for all APs regardless of handshake state.
          * The handshake flag only prevents redundant file writes. */
 
+
+        /* Phase 2C: Stationary diminishing returns check */
+        if (ctx->mobility_ctx.current_mode == MOBILITY_STATIONARY) {
+            if (ctx->epoch.num_shakes > 0) {
+                for (int _sc = 0; _sc < ctx->epoch.num_shakes; _sc++)
+                    stat_record_capture(&ctx->stationary);
+            }
+            if (stat_should_permanent_soak(&ctx->stationary)) {
+                fprintf(stderr, "[brain] [stationary] Entering permanent passive soak (diminishing returns)\n");
+                brain_set_mood(ctx, MOOD_SOAKING);
+            }
+            /* Check phase expiry and advance */
+            if (stat_phase_expired(&ctx->stationary)) {
+                stat_phase_t _new_phase = stat_advance_phase(&ctx->stationary);
+                fprintf(stderr, "[brain] [stationary] Phase -> %s\n", stat_phase_name(_new_phase));
+                if (_new_phase == STAT_PHASE_SOAK) {
+                    brain_set_mood(ctx, MOOD_SOAKING);
+                } else if (_new_phase == STAT_PHASE_BURST) {
+                    brain_set_mood(ctx, MOOD_HUNTING);
+                }
+            }
+        }
+
+        /* Phase 2D: Walking GPS breadcrumb per epoch */
+        if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING && ctx->gps && ctx->gps->has_fix) {
+            walk_breadcrumb(&ctx->walking, ctx->gps->latitude, ctx->gps->longitude,
+                           (uint16_t)ctx->total_aps);
+            walk_proximity_tick(&ctx->walking);
+        }
 
         /* AUDIT FIX: Firmware health epoch tick + EAPOL cleanup */
         fw_health_epoch_tick(&ctx->fw_health);
@@ -2739,8 +2969,10 @@ void brain_destroy(brain_ctx_t *ctx) {
     
     brain_stop(ctx);
 
-    /* AUDIT FIX: Stop EAPOL monitor + cleanup fw_health */
+    /* AUDIT FIX: Stop EAPOL monitor + cleanup fw_health + channel_map */
     eapol_monitor_stop(&ctx->eapol_mon);
+    fw_health_destroy(&ctx->fw_health);
+    channel_map_destroy(&ctx->channel_map);
     {
         extern fw_health_t *g_fw_health;
         g_fw_health = NULL;

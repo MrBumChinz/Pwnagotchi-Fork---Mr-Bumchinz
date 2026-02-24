@@ -261,6 +261,25 @@ void themes_cleanup(void) {
  * Load a PNG file and convert to 1-bit bitmap
  * Returns 0 on success, -1 on error
  */
+/* PNG filename aliases for community themes.
+ * Non-default themes use SLEEP instead of SLEEP1, UPLOAD instead of 00, etc.
+ * Try these alternate filenames when the primary name fails to load. */
+typedef struct {
+    face_state_t state;
+    const char *alt_name;
+} face_alias_t;
+
+static const face_alias_t g_face_aliases[] = {
+    { FACE_SLEEP1,     "SLEEP"   },  /* SLEEP.png -> SLEEP1 */
+    { FACE_SLEEP3,     "SLEEP2"  },  /* Reuse SLEEP2 for missing SLEEP3 */
+    { FACE_SLEEP4,     "SLEEP"   },  /* Reuse SLEEP for missing SLEEP4 */
+    { FACE_UPLOAD_00,  "UPLOAD"  },  /* UPLOAD.png -> 00 */
+    { FACE_UPLOAD_01,  "UPLOAD1" },  /* UPLOAD1.png -> 01 */
+    { FACE_UPLOAD_10,  "UPLOAD2" },  /* UPLOAD2.png -> 10 */
+    { FACE_UPLOAD_11,  "UPLOAD"  },  /* Reuse UPLOAD for missing 11 */
+};
+#define NUM_FACE_ALIASES (sizeof(g_face_aliases) / sizeof(g_face_aliases[0]))
+
 static int load_face_png(const char *path, face_bitmap_t *face) {
     unsigned char *rgba = NULL;
     unsigned width, height;
@@ -273,7 +292,7 @@ static int load_face_png(const char *path, face_bitmap_t *face) {
     error = lodepng_decode32_file(&rgba, &width, &height, path);
     if (error) {
         if (dbg) { fprintf(dbg, "PNG decode error %u: %s - %s\n", error, lodepng_error_text(error), path); fclose(dbg); }
-        fprintf(stderr, "PNG decode error %u: %s\n", error, lodepng_error_text(error));
+        if (error != 78) fprintf(stderr, "PNG decode error %u: %s\n", error, lodepng_error_text(error));
         return -1;
     }
     
@@ -492,10 +511,36 @@ theme_t *theme_load(const char *name) {
         }
         
         snprintf(png_path, sizeof(png_path), "%s/%s.png", faces_dir, face_name);
-        
-        if (load_face_png(png_path, &theme->faces[i]) == 0) {
+
+        int face_loaded = (load_face_png(png_path, &theme->faces[i]) == 0);
+
+        /* Try alias filenames for community themes (SLEEP->SLEEP1, UPLOAD->00, etc.) */
+        if (!face_loaded) {
+            for (int a = 0; a < (int)NUM_FACE_ALIASES; a++) {
+                if (g_face_aliases[a].state == (face_state_t)i) {
+                    char alt_name[64];
+                    if (use_lowercase) {
+                        strncpy(alt_name, g_face_aliases[a].alt_name, sizeof(alt_name) - 1);
+                        alt_name[sizeof(alt_name) - 1] = '\0';
+                        for (char *p = alt_name; *p; p++) {
+                            if (*p >= 'A' && *p <= 'Z') *p = *p - 'A' + 'a';
+                        }
+                    } else {
+                        strncpy(alt_name, g_face_aliases[a].alt_name, sizeof(alt_name) - 1);
+                        alt_name[sizeof(alt_name) - 1] = '\0';
+                    }
+                    snprintf(png_path, sizeof(png_path), "%s/%s.png", faces_dir, alt_name);
+                    if (load_face_png(png_path, &theme->faces[i]) == 0) {
+                        face_loaded = 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (face_loaded) {
             loaded_count++;
-            
+
             /* Track common face dimensions */
             if (theme->face_width == 0) {
                 theme->face_width = theme->faces[i].width;

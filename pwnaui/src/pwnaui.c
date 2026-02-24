@@ -858,12 +858,16 @@ static void brain_mood_callback(brain_mood_t mood, void *user_data) {
     }
 
     /* Start/stop animations based on mood */
-    if (mood == MOOD_NORMAL || mood == MOOD_STARTING) {
+    if (mood == MOOD_NORMAL || mood == MOOD_STARTING ||
+        mood == MOOD_WALKING || mood == MOOD_SCANNING ||
+        mood == MOOD_HUNTING) {
         animation_start(ANIM_LOOK, 2500);
-    } else if (mood == MOOD_EXCITED) {
+    } else if (mood == MOOD_EXCITED || mood == MOOD_JACKPOT) {
         animation_start(ANIM_LOOK_HAPPY, 2500);
-    } else if (mood == MOOD_SLEEPING) {
+    } else if (mood == MOOD_SLEEPING || mood == MOOD_COOLDOWN) {
         animation_start(ANIM_SLEEP, 2000);
+    } else if (mood == MOOD_SYNCING) {
+        animation_start(ANIM_UPLOAD, 1000);
     } else {
         animation_stop();
         g_ui_state.face_enum = face_state;
