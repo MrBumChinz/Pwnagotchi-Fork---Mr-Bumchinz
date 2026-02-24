@@ -29,13 +29,18 @@
  * ============================================================================ */
 
 /* Hysteresis: consecutive readings before mode switch */
-#define MOB_HYSTERESIS_COUNT    3
-#define MOB_GPS_HYSTERESIS      2      /* Faster switch when GPS speed confirms */
+#define MOB_HYSTERESIS_COUNT    5
+#define MOB_GPS_HYSTERESIS      3      /* Faster switch when GPS speed confirms */
 
 /* GPS speed thresholds (km/h) */
 #define MOB_SPEED_DRIVING       15.0    /* > 15 km/h = driving */
-#define MOB_SPEED_WALKING        1.5    /* 1.5-15 km/h = walking */
+#define MOB_SPEED_WALKING        3.0    /* 3-15 km/h = walking (raised from 1.5; GPS jitter) */
                                         /* < 2 km/h = stationary */
+
+/* Speed smoothing: EMA alpha (lower = smoother, 0.3 = ~5 sample window) */
+#define MOB_SPEED_SMOOTH_ALPHA  0.3f
+#define MOB_SPEED_MAX_SANE      120.0f  /* Reject GPS > 120 km/h as noise */
+#define MOB_SWITCH_COOLDOWN_S   45      /* Min seconds between mode switches */
 
 /* AP churn thresholds (fraction of total APs changed per check) */
 #define MOB_CHURN_DRIVING        0.7    /* > 70% AP turnover = driving */
@@ -106,6 +111,7 @@ typedef struct {
 
     /* Input snapshot (updated each check) */
     float gps_speed_kmh;                /* Latest GPS speed */
+    float smoothed_speed;               /* EMA-smoothed GPS speed */
     float mobility_score;               /* Latest brain mobility_score */
     float ap_churn_rate;                /* AP churn fraction (0.0-1.0) */
     int   total_aps;                    /* Total APs visible */

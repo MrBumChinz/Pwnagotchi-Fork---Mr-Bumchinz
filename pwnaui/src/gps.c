@@ -37,6 +37,7 @@ static struct {
 } _pos_ring[GPS_POS_WINDOW];
 static int _pos_ring_idx = 0;
 static int _pos_ring_count = 0;
+static bool _gpgga_speed_valid = false;  /* True when GPGGA haversine speed is computed */
 
 static double _gps_haversine(double lat1, double lon1, double lat2, double lon2) {
     double dlat = (lat2 - lat1) * M_PI / 180.0;
@@ -358,8 +359,12 @@ int nmea_parse_gpvtg(const char *sentence, gps_data_t *data) {
     
     if (parsed >= 7) {
         data->bearing = bearing;
-        data->speed_knots = speed_knots;
-        data->speed_kmh = speed_kmh;
+        /* Only use GPVTG speed if GPGGA haversine hasn't computed one.
+         * GPGGA haversine is much more stable than raw NMEA speed. */
+        if (!_gpgga_speed_valid) {
+            data->speed_knots = speed_knots;
+            data->speed_kmh = speed_kmh;
+        }
         return 1;
     }
     
@@ -392,8 +397,12 @@ int nmea_parse_gprmc(const char *sentence, gps_data_t *data) {
     if (parsed >= 6 && status == 'A') {
         data->latitude = nmea_parse_coord(lat_str, lat_dir);
         data->longitude = nmea_parse_coord(lon_str, lon_dir);
-        data->speed_knots = speed_knots;
-        data->speed_kmh = speed_knots * 1.852;
+        /* Only use GPRMC speed if GPGGA haversine hasn't computed one.
+         * Raw NMEA speed-over-ground is very noisy from phone GPS. */
+        if (!_gpgga_speed_valid) {
+            data->speed_knots = speed_knots;
+            data->speed_kmh = speed_knots * 1.852;
+        }
         data->bearing = bearing;
         data->has_fix = true;
         return 1;
@@ -490,6 +499,7 @@ int plugin_gps_handle_data(gps_data_t *data) {
                         data->speed_kmh = (dist_m / dt_s) * 3.6;
                     }
                     data->speed_knots = data->speed_kmh / 1.852;
+                    _gpgga_speed_valid = true;  /* GPGGA haversine speed is authoritative */
                 }
             }
         }

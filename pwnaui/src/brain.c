@@ -99,8 +99,9 @@ static void update_mobility(brain_ctx_t *ctx) {
     }
 
     /* Debug: always log mobility inputs for troubleshooting */
-    fprintf(stderr, "[brain] [mobility-dbg] spd=%.1fkm/h score=%.2f churn=%.2f(delta=%d/aps=%d) mode=%s\n",
+    fprintf(stderr, "[brain] [mobility-dbg] raw=%.1f smooth=%.1fkm/h score=%.2f churn=%.2f(delta=%d/aps=%d) mode=%s\n",
             (ctx->gps && ctx->gps->has_fix) ? (float)ctx->gps->speed_kmh : -1.0f,
+            ctx->mobility_ctx.smoothed_speed >= 0 ? ctx->mobility_ctx.smoothed_speed : -1.0f,
             ctx->mobility_score, 
             (ctx->total_aps > 0) ? (float)ap_delta / (float)ctx->total_aps : 0.0f,
             ap_delta, ctx->total_aps,

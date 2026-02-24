@@ -113,6 +113,7 @@ int mobility_mode_init(mobility_ctx_t *ctx) {
     ctx->current_mode = MOBILITY_STATIONARY;
     ctx->pending_mode = MOBILITY_STATIONARY;
     ctx->pending_count = 0;
+    ctx->smoothed_speed = -1.0f;  /* No valid GPS yet */
     ctx->session_start = time(NULL);
     ctx->mode_since = ctx->session_start;
     ctx->last_check = ctx->session_start;
@@ -142,8 +143,30 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
     ctx->total_aps = total_aps;
     ctx->last_check = now;
 
-    /* Classify current reading */
-    mobility_mode_t detected = classify(gps_speed, mob_score, ap_churn);
+    /* GPS speed sanity clamp: reject absurd readings as noise */
+    if (gps_speed > MOB_SPEED_MAX_SANE) {
+        fprintf(stderr, "[mobility] GPS speed %.1f km/h rejected (>%.0f max sane)\n",
+                gps_speed, MOB_SPEED_MAX_SANE);
+        gps_speed = -1.0f;  /* Treat as no-GPS for this reading */
+    }
+
+    /* EMA speed smoothing: dampens GPS noise spikes.
+     * Only smooth valid GPS readings (>= 0).
+     * On first valid reading, seed the EMA. */
+    float smoothed = gps_speed;
+    if (gps_speed >= 0.0f) {
+        if (ctx->smoothed_speed < 0.0f) {
+            /* First valid GPS reading — seed EMA */
+            ctx->smoothed_speed = gps_speed;
+        } else {
+            ctx->smoothed_speed = MOB_SPEED_SMOOTH_ALPHA * gps_speed
+                                + (1.0f - MOB_SPEED_SMOOTH_ALPHA) * ctx->smoothed_speed;
+        }
+        smoothed = ctx->smoothed_speed;
+    }
+
+    /* Use smoothed speed for classification, not raw */
+    mobility_mode_t detected = classify(smoothed, mob_score, ap_churn);
 
     /* Debug log every update for field diagnosis */
     {
@@ -156,9 +179,9 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
                 char ts[32];
                 strftime(ts, sizeof(ts), "%H:%M:%S", tm);
                 static const char *mode_names[] = {"STA","WLK","DRV"};
-                fprintf(f, "[%s] spd=%.1f mob=%.2f churn=%.2f aps=%d "
+                fprintf(f, "[%s] raw=%.1f smooth=%.1f mob=%.2f churn=%.2f aps=%d "
                         "cur=%s det=%s pend=%s cnt=%d\n",
-                        ts, gps_speed, mob_score, ap_churn, total_aps,
+                        ts, gps_speed, ctx->smoothed_speed >= 0 ? ctx->smoothed_speed : -1.0f, mob_score, ap_churn, total_aps,
                         mode_names[ctx->current_mode],
                         mode_names[detected],
                         mode_names[ctx->pending_mode],
@@ -184,27 +207,27 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
         ctx->pending_count = 1;
     }
 
-        /* Adaptive hysteresis based on signal clarity.
-     * When GPS clearly confirms the mode, switch instantly.
-     * When near threshold boundaries or no GPS, require more readings. */
+            /* Hysteresis: always require multiple consecutive readings.
+     * Never use threshold=1 — GPS noise can produce single-reading spikes.
+     * With EMA smoothing the speed is already dampened, but we still
+     * want at least GPS_HYSTERESIS (3) readings for GPS-based switches
+     * and HYSTERESIS_COUNT (5) for AP-churn-only fallback. */
     int threshold;
     if (gps_speed < 0.0f) {
-        /* No GPS fix -- using noisy AP churn fallback, need more readings */
+        /* No GPS fix -- AP churn fallback is noisy */
         threshold = MOB_HYSTERESIS_COUNT;
-    } else if (gps_speed > MOB_SPEED_DRIVING + 5.0f) {
-        /* Clearly driving (>20 km/h) -- instant */
-        threshold = 1;
-    } else if (gps_speed > MOB_SPEED_WALKING + 1.5f && gps_speed < MOB_SPEED_DRIVING - 3.0f) {
-        /* Clearly walking (3-12 km/h) -- instant */
-        threshold = 1;
-    } else if (gps_speed < 0.3f) {
-        /* GPS says basically zero -- instant stationary */
-        threshold = 1;
     } else {
-        /* GPS near a threshold boundary -- 2 readings for safety */
+        /* GPS present -- still require multiple readings */
         threshold = MOB_GPS_HYSTERESIS;
     }
     if (ctx->pending_count >= threshold) {
+        /* Cooldown: don't switch again within MOB_SWITCH_COOLDOWN_S seconds.
+         * Prevents rapid flapping when GPS noise alternates readings. */
+        if ((now - ctx->mode_since) < MOB_SWITCH_COOLDOWN_S) {
+            /* Too soon after last switch — suppress */
+            return false;
+        }
+
         /* MODE SWITCH */
         mobility_mode_t old_mode = ctx->current_mode;
 
