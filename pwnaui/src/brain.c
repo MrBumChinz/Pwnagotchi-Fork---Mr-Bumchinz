@@ -676,39 +676,63 @@ void brain_epoch_track(brain_epoch_t *epoch, bool deauth, bool assoc,
 
 /* Sprint 7 #20: Adaptive epoch duration - scale channel dwell time */
 static void adapt_epoch_timing(brain_ctx_t *ctx) {
-    int base_dwell = 5;  /* default hop_recon_time */
     int ap_count = ctx->total_aps;
 
-    /* AP density scaling */
-    if (ap_count > 20) {
-        base_dwell = 2;       /* Dense area: cycle fast */
-    } else if (ap_count > 10) {
-        base_dwell = 3;       /* Moderate: slightly faster */
-    } else if (ap_count > 5) {
-        base_dwell = 5;       /* Normal */
-    } else if (ap_count > 0) {
-        base_dwell = 8;       /* Sparse: dwell longer */
-    } else {
-        base_dwell = 10;      /* No APs: listen hard */
-    }
-
-    /* Success rate: got handshakes? Strike while hot */
-    if (ctx->epoch.num_shakes > 0) {
-        base_dwell = (base_dwell * 2) / 3;  /* 33% faster if capturing */
-    }
-
-    /* Mobility: moving = scan faster */
+    /* AUDIT FIX: Try ML dwell time model first (trained on PC Brain data).
+     * Model 4 uses AP density bucket + mobility mode + success rate. */
+    int mobility_mode = 1;  /* default: stationary */
     if (ctx->mobility_score > 0.5f) {
-        base_dwell = base_dwell / 2;        /* Fast movement: halve dwell */
-    } else if (ctx->mobility_score > 0.3f) {
-        base_dwell = (base_dwell * 3) / 4;  /* Moderate movement: 25% faster */
+        mobility_mode = 0;  /* driving */
+    } else if (ctx->mobility_score > 0.2f) {
+        mobility_mode = 2;  /* walking */
     }
+    float success_rate = 0.0f;
+    if (ctx->total_aps > 0) {
+        success_rate = (float)ctx->epoch.num_shakes / (float)ctx->total_aps;
+    }
+    int ml_dwell = get_dwell_time(ap_count, mobility_mode, success_rate);
+    int base_dwell;
 
-    /* Inactive streak: extend dwell for deeper listening */
-    if (ctx->epoch.inactive_for > 10) {
-        base_dwell += 3;     /* Very inactive: listen longer */
-    } else if (ctx->epoch.inactive_for > 5) {
-        base_dwell += 1;     /* Somewhat inactive */
+    if (ml_dwell > 3 && ml_dwell != 30) {
+        /* ML model returned a meaningful value (not the default 30 fallback).
+         * Dwell table is in seconds already. */
+        base_dwell = ml_dwell;
+        if (base_dwell > 60) base_dwell = 60;
+    } else {
+        /* Fallback: heuristic (ML model not available or returned default) */
+        base_dwell = 5;  /* default hop_recon_time */
+
+        /* AP density scaling */
+        if (ap_count > 20) {
+            base_dwell = 2;       /* Dense area: cycle fast */
+        } else if (ap_count > 10) {
+            base_dwell = 3;       /* Moderate: slightly faster */
+        } else if (ap_count > 5) {
+            base_dwell = 5;       /* Normal */
+        } else if (ap_count > 0) {
+            base_dwell = 8;       /* Sparse: dwell longer */
+        } else {
+            base_dwell = 10;      /* No APs: listen hard */
+        }
+
+        /* Success rate: got handshakes? Strike while hot */
+        if (ctx->epoch.num_shakes > 0) {
+            base_dwell = (base_dwell * 2) / 3;  /* 33% faster if capturing */
+        }
+
+        /* Mobility: moving = scan faster */
+        if (ctx->mobility_score > 0.5f) {
+            base_dwell = base_dwell / 2;        /* Fast movement: halve dwell */
+        } else if (ctx->mobility_score > 0.3f) {
+            base_dwell = (base_dwell * 3) / 4;  /* Moderate movement: 25% faster */
+        }
+
+        /* Inactive streak: extend dwell for deeper listening */
+        if (ctx->epoch.inactive_for > 10) {
+            base_dwell += 3;     /* Very inactive: listen longer */
+        } else if (ctx->epoch.inactive_for > 5) {
+            base_dwell += 1;     /* Somewhat inactive */
+        }
     }
 
     /* Clamp to configured bounds */
@@ -1547,6 +1571,29 @@ static void *brain_thread_func(void *arg) {
                 }
             }
             channel_map_build(&ctx->channel_map, _cch, _ccl, _ccp, _crs, _cmn, NULL);
+
+            /* AUDIT FIX: Blend ML channel yield predictions into channel_map scores.
+             * predict_channel_yield() returns P(handshake) per channel from
+             * time-of-day + day-of-week patterns learned on PC Brain. */
+            {
+                channel_query_t _cq;
+                float _ml_yield[14];
+                time_t _cqt = time(NULL);
+                struct tm *_cqtm = localtime(&_cqt);
+                _cq.time_of_day = _cqtm ? (float)_cqtm->tm_hour / 24.0f : 0.5f;
+                _cq.gps_zone = 0.0f;
+                _cq.day_of_week = _cqtm ? (float)_cqtm->tm_wday / 7.0f : 0.5f;
+                if (predict_channel_yield(&_cq, _ml_yield) == 0) {
+                    /* Boost channel_map entries with ML yield (additive 20% weight) */
+                    for (int ci = 0; ci < ctx->channel_map.count; ci++) {
+                        int ch = ctx->channel_map.entries[ci].channel;
+                        if (ch >= 1 && ch <= 14) {
+                            float ml_boost = _ml_yield[ch - 1] * CMAP_W_UNCAPTURED * 0.2f;
+                            ctx->channel_map.entries[ci].expected_yield += ml_boost;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1793,6 +1840,26 @@ static void *brain_thread_func(void *arg) {
                     }
                 }
                 channel_map_build(&ctx->channel_map, _cch, _ccl, _ccp, _crs, _cmn, NULL);
+
+                /* AUDIT FIX: Blend ML channel yield into channel_map (same as init) */
+                {
+                    channel_query_t _cq2;
+                    float _ml_yield2[14];
+                    time_t _cqt2 = time(NULL);
+                    struct tm *_cqtm2 = localtime(&_cqt2);
+                    _cq2.time_of_day = _cqtm2 ? (float)_cqtm2->tm_hour / 24.0f : 0.5f;
+                    _cq2.gps_zone = 0.0f;
+                    _cq2.day_of_week = _cqtm2 ? (float)_cqtm2->tm_wday / 7.0f : 0.5f;
+                    if (predict_channel_yield(&_cq2, _ml_yield2) == 0) {
+                        for (int ci = 0; ci < ctx->channel_map.count; ci++) {
+                            int ch2 = ctx->channel_map.entries[ci].channel;
+                            if (ch2 >= 1 && ch2 <= 14) {
+                                float ml_boost = _ml_yield2[ch2 - 1] * CMAP_W_UNCAPTURED * 0.2f;
+                                ctx->channel_map.entries[ci].expected_yield += ml_boost;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -2093,17 +2160,15 @@ static void *brain_thread_func(void *arg) {
                         }
                     }
 
-                    /* AUDIT FIX: ML vulnerability prediction */
+                    /* AUDIT FIX: ML vulnerability prediction — use make_ap_features()
+                     * for correct vendor_category, encryption_type, beacon_flag */
                     {
-                        ap_features_t _ml_feat;
-                        memset(&_ml_feat, 0, sizeof(_ml_feat));
-                        _ml_feat.rssi_norm = ((float)ap.rssi + 100.0f) / 60.0f;
-                        _ml_feat.client_count_log = logf((float)ap.clients_count + 1.0f);
-                        _ml_feat.channel_norm = (float)ap.channel / 14.0f;
-                        _ml_feat.encryption_type = 1.0f; /* WPA2 default */
                         time_t _mlt = time(NULL);
                         struct tm *_mltm = localtime(&_mlt);
-                        _ml_feat.time_of_day = _mltm ? (float)_mltm->tm_hour / 24.0f : 0.5f;
+                        int _ml_hour = _mltm ? _mltm->tm_hour : 12;
+                        ap_features_t _ml_feat = make_ap_features(
+                            ap.vendor, ap.encryption, ap.channel, ap.ssid,
+                            ap.clients_count, ap.rssi, _ml_hour);
                         float _ml_vuln = predict_vulnerability(&_ml_feat);
                         if (entity && _ml_vuln > 0.0f) {
                             entity->client_boost += _ml_vuln * 0.3f;
@@ -2294,15 +2359,18 @@ static void *brain_thread_func(void *arg) {
                         }
                         /* Phase 5: ML attack phase prediction — boost Thompson choice */
                         {
+                            time_t _mlt2 = time(NULL);
+                            struct tm *_mltm2 = localtime(&_mlt2);
+                            int _ml_hour2 = _mltm2 ? _mltm2->tm_hour : 12;
                             ap_features_ext_t _ml_ext;
                             memset(&_ml_ext, 0, sizeof(_ml_ext));
-                            _ml_ext.base.rssi_norm = ((float)ap.rssi + 100.0f) / 60.0f;
-                            _ml_ext.base.client_count_log = logf((float)ap.clients_count + 1.0f);
-                            _ml_ext.base.channel_norm = (float)ap.channel / 14.0f;
-                            _ml_ext.base.encryption_type = is_wpa3 ? 2.0f : 1.0f;
+                            _ml_ext.base = make_ap_features(
+                                ap.vendor, ap.encryption, ap.channel, ap.ssid,
+                                ap.clients_count, ap.rssi, _ml_hour2);
                             float _ta = ap_tracker->atk_alpha[attack_phase];
                             float _tb = ap_tracker->atk_beta[attack_phase];
                             _ml_ext.thompson_ratio = (_ta + _tb > 0) ? _ta / (_ta + _tb) : 0.5f;
+                            _ml_ext.has_pmkid = (_hs_q == HS_QUALITY_PMKID) ? 1.0f : 0.0f;
                             _ml_ext.is_wpa3 = is_wpa3 ? 1.0f : 0.0f;
                             int _ml_phase = predict_attack_phase(&_ml_ext);
                             if (_ml_phase >= 0 && _ml_phase < BRAIN_NUM_ATTACK_PHASES &&

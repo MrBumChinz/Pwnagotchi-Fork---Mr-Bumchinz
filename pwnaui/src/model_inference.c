@@ -334,8 +334,14 @@ ap_features_t make_ap_features(const char *vendor, const char *encryption,
             f.encryption_type = -1.0f;
     }
 
-    /* Channel */
-    f.channel_norm = clamp_f((float)channel / 14.0f, 0.0f, 1.0f);
+    /* Channel — dual-band normalization matching training pipeline */
+    if (channel > 14) {
+        /* 5GHz: map ch 36-165 to [0.5, 1.0] */
+        f.channel_norm = clamp_f(0.5f + (float)(channel - 36) / 258.0f, 0.5f, 1.0f);
+    } else {
+        /* 2.4GHz: ch/14 */
+        f.channel_norm = clamp_f((float)channel / 14.0f, 0.0f, 0.5f);
+    }
 
     /* Beacon / hidden SSID */
     f.beacon_flag = (ssid && ssid[0] != '\0') ? 0.0f : 2.0f;
