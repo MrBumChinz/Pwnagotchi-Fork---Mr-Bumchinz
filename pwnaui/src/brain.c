@@ -30,6 +30,15 @@
 #include "hc22000.h"
 #include "gps_refine.h"
 #include "attack_log.h"
+#include "channel_map.h"
+#include "rssi_trend.h"
+#include "model_inference.h"
+#include "walking_mode.h"
+#include "stationary_mode.h"
+#include "driving_mode.h"
+#include "ap_triage.h"
+#include "firmware_health.h"
+#include "eapol_monitor.h"
 
 /* ============================================================================
  * Sprint 4: Mobility + RSSI Helpers
@@ -1053,7 +1062,8 @@ static void brain_update_mood(brain_ctx_t *ctx) {
                 if (e->num_deauths > 0 || e->num_assocs > 0) {
                     brain_set_mood(ctx, MOOD_HUNTING);
                 } else {
-                    brain_set_mood(ctx, MOOD_NORMAL);
+                    /* AUDIT FIX: MOOD_SOAKING for passive stationary */
+                    brain_set_mood(ctx, MOOD_SOAKING);
                 }
                 break;
         }
@@ -1131,6 +1141,9 @@ void brain_prune_history(brain_ctx_t *ctx) {
  * ========================================================================== */
 
 int brain_recon(brain_ctx_t *ctx) {
+    /* AUDIT FIX: Show MOOD_SCANNING during active recon */
+    brain_set_mood(ctx, MOOD_SCANNING);
+
     /* Start recon */
     int ret = bcap_send_command(ctx->bcap, "wifi.recon on");
     if (ret < 0) {
@@ -1376,9 +1389,29 @@ static void *brain_thread_func(void *arg) {
     ctx->home_mode_active = false;
     ctx->home_mode_entered = 0;
 
+
+    /* AUDIT FIX: Initialize EAPOL monitor for real-time handshake detection */
+    if (eapol_monitor_init(&ctx->eapol_mon, "wlan0mon") == 0) {
+        if (eapol_monitor_start(&ctx->eapol_mon) == 0) {
+            fprintf(stderr, "[brain] EAPOL monitor started\n");
+        } else {
+            fprintf(stderr, "[brain] WARNING: EAPOL monitor start failed\n");
+        }
+    } else {
+        fprintf(stderr, "[brain] WARNING: EAPOL monitor init failed\n");
+    }
+
     /* Phase 1C: Initialize mobility mode detector */
     mobility_mode_init(&ctx->mobility_ctx);
     fprintf(stderr, "[brain] Mobility mode detector initialized\n");
+    /* AUDIT FIX: Initialize mode-specific pipelines */
+    drv_init(&ctx->driving);
+    walk_init(&ctx->walking);
+    stat_init(&ctx->stationary);
+    channel_map_init(&ctx->channel_map);
+    model_inference_init();
+    fprintf(stderr, "[brain] Mode pipelines initialized (drv/walk/stat/cmap/model)\n");
+
 
     /* Starting mood */
     brain_set_mood(ctx, MOOD_STARTING);
@@ -1432,6 +1465,30 @@ static void *brain_thread_func(void *arg) {
     /* Start recon */
     brain_recon(ctx);
     usleep(ctx->config.recon_time * 1000000);
+
+
+    /* AUDIT FIX: Build channel map from per-AP scan data */
+    {
+        int _cmn = bcap_get_ap_count(ctx->bcap);
+        if (_cmn > 0 && _cmn <= 256) {
+            int _cch[256], _ccl[256], _crs[256];
+            bool _ccp[256];
+            for (int ai = 0; ai < _cmn; ai++) {
+                bcap_ap_t _cma;
+                if (bcap_get_ap(ctx->bcap, ai, &_cma) == 0) {
+                    _cch[ai] = _cma.channel;
+                    _ccl[ai] = _cma.clients_count;
+                    _crs[ai] = _cma.rssi;
+                    char _cmm[18];
+                    mac_to_str(&_cma.bssid, _cmm);
+                    _ccp[ai] = (get_handshake_quality(_cmm) == HS_QUALITY_FULL);
+                } else {
+                    _cch[ai] = 0; _ccl[ai] = 0; _crs[ai] = -100; _ccp[ai] = false;
+                }
+            }
+            channel_map_build(&ctx->channel_map, _cch, _ccl, _ccp, _crs, _cmn, NULL);
+        }
+    }
 
     /* Sprint 7 #20: Initial adaptive timing based on first scan */
     adapt_epoch_timing(ctx);
@@ -1601,6 +1658,8 @@ static void *brain_thread_func(void *arg) {
                 /* Sprint 8: Hash sync when on home network */
                 if (hash_sync_is_due() && hash_sync_has_internet()) {
                     fprintf(stderr, "[brain] [home] Internet available - running hash sync\n");
+                    /* AUDIT FIX: Set MOOD_SYNCING during sync */
+                    brain_set_mood(ctx, MOOD_SYNCING);
                     hash_sync_result_t _hsync;
                     hash_sync_run(&_hsync);
                     if (_hsync.success) {
@@ -1845,6 +1904,15 @@ static void *brain_thread_func(void *arg) {
                     /* Already have crackable handshake, skip entirely */
                     continue;
                 }
+                /* AUDIT FIX: Skip APs with live EAPOL captures detected */
+                {
+                    uint8_t _ebssid[6];
+                    memcpy(_ebssid, ap.bssid.addr, 6);
+                    if (eapol_monitor_has_capture(&ctx->eapol_mon, _ebssid)) {
+                        continue;  /* EAPOL monitor already detected capture */
+                    }
+                }
+
                 int _has_hs = (_hs_q == HS_QUALITY_PARTIAL || _hs_q == HS_QUALITY_PMKID);
                 
                 /* Skip blacklisted APs (too many failed deauths, retried after TTL) */
@@ -1865,7 +1933,64 @@ static void *brain_thread_func(void *arg) {
                     
                     /* Update signal tracker */
                     ts_update_signal(entity, ap.rssi);
+                    /* AUDIT FIX: Record RSSI trend via attack tracker */
+                    {
+                        brain_attack_tracker_t *_atrk = get_attack_tracker(ctx, mac_str);
+                        if (_atrk) {
+                            rssi_trend_record(&_atrk->rssi_trend, (int8_t)ap.rssi);
+                        }
+                    }
+
+                    /* AUDIT FIX: AP Triage classification */
+                    {
+                        ap_triage_input_t _tri_in;
+                        ap_triage_result_t _tri_out;
+                        memset(&_tri_in, 0, sizeof(_tri_in));
+                        memset(&_tri_out, 0, sizeof(_tri_out));
+                        _tri_in.rssi = (int8_t)ap.rssi;
+                        _tri_in.clients_count = ap.clients_count;
+                        strncpy(_tri_in.encryption, ap.encryption, sizeof(_tri_in.encryption) - 1);
+                        _tri_in.handshake_captured = (_hs_q == HS_QUALITY_FULL);
+                        _tri_in.pmkid_available = (_hs_q == HS_QUALITY_PMKID);
+                        _tri_in.is_whitelisted = (ctx->stealth && stealth_is_whitelisted(ctx->stealth, ap.ssid));
+                        _tri_in.is_blacklisted = brain_is_blacklisted(ctx, mac_str);
+                        if (entity) {
+                            _tri_in.thompson_alpha = entity->alpha;
+                            _tri_in.thompson_beta = entity->beta;
+                            _tri_in.client_boost = entity->client_boost;
+                        }
+                        _tri_in.now = time(NULL);
+                        ap_triage_classify(&_tri_in, &_tri_out);
+
+                        if (_tri_out.tier == TRIAGE_SKIP) {
+                            continue;  /* Triage says skip entirely */
+                        }
+                    }
+
+                    /* AUDIT FIX: ML vulnerability prediction */
+                    {
+                        ap_features_t _ml_feat;
+                        memset(&_ml_feat, 0, sizeof(_ml_feat));
+                        _ml_feat.rssi_norm = ((float)ap.rssi + 100.0f) / 60.0f;
+                        _ml_feat.client_count_log = logf((float)ap.clients_count + 1.0f);
+                        _ml_feat.channel_norm = (float)ap.channel / 14.0f;
+                        _ml_feat.encryption_type = 1.0f; /* WPA2 default */
+                        time_t _mlt = time(NULL);
+                        struct tm *_mltm = localtime(&_mlt);
+                        _ml_feat.time_of_day = _mltm ? (float)_mltm->tm_hour / 24.0f : 0.5f;
+                        float _ml_vuln = predict_vulnerability(&_ml_feat);
+                        if (entity && _ml_vuln > 0.0f) {
+                            entity->client_boost += _ml_vuln * 0.3f;
+                        }
+                    }
                     
+                    /* AUDIT FIX: MOOD_JACKPOT for strong new uncaptured AP */
+                    if (ap.rssi >= -50 && ap.clients_count > 0 && _hs_q == HS_QUALITY_NONE) {
+                        brain_set_mood(ctx, MOOD_JACKPOT);
+                        fprintf(stderr, "[brain] JACKPOT! Strong AP: %s %ddBm ch%d clients=%d\n",
+                                ap.ssid, ap.rssi, ap.channel, ap.clients_count);
+                    }
+
                     /* Boost score for APs with clients (better handshake targets) */
                     if (ap.clients_count > 0) {
                         /* More clients = higher chance of capturing handshake on deauth */
@@ -2302,6 +2427,12 @@ static void *brain_thread_func(void *arg) {
                         ts_observe_mode_outcome(ctx->thompson, ctx->current_mode, true);
                         ctx->mode_handshakes++;
                     }
+                    /* AUDIT FIX: Set MOOD_PWNED on handshake capture */
+                    brain_set_mood(ctx, MOOD_PWNED);
+
+                    /* AUDIT FIX: Record capture in channel map */
+                    if (w) channel_map_record_capture(&ctx->channel_map, w->channel);
+
                     fprintf(stderr, "[brain] HANDSHAKE! %s rewarded (ch%d, mode=%s)\n", 
                             ctx->pending_attack_mac, 
                             w ? w->channel : 0,
@@ -2388,6 +2519,12 @@ static void *brain_thread_func(void *arg) {
         brain_update_mood(ctx);
         cpu_act_end(g_health_state, CPU_ACT_EPOCH_END, _t0); }
 
+
+        /* AUDIT FIX: Check firmware health for MOOD_COOLDOWN */
+        if (fw_health_in_cooldown(&ctx->fw_health)) {
+            brain_set_mood(ctx, MOOD_COOLDOWN);
+        }
+
         /* HULK RECURRING: If still ANGRY, SMASH again every 5 epochs.
          * First HULK fires on mood transition (in brain_set_mood).
          * Subsequent HULKs fire here while anger persists. */
@@ -2432,6 +2569,11 @@ static void *brain_thread_func(void *arg) {
          * 3. Loss of tracking data mid-session
          * Bettercap captures EAPOL for all APs regardless of handshake state.
          * The handshake flag only prevents redundant file writes. */
+
+
+        /* AUDIT FIX: Firmware health epoch tick + EAPOL cleanup */
+        fw_health_epoch_tick(&ctx->fw_health);
+        eapol_monitor_evict_stale(&ctx->eapol_mon);
 
         /* Garbage collect Thompson brain periodically */
         ts_garbage_collect(ctx->thompson);
@@ -2520,6 +2662,16 @@ brain_ctx_t *brain_create(const brain_config_t *config, bcap_ws_ctx_t *bcap) {
                 ctx->crack_mgr->total_cracked);
     }
     
+
+    /* AUDIT FIX: Initialize firmware health monitor */
+    if (fw_health_init(&ctx->fw_health, "wlan0mon") == 0) {
+        extern fw_health_t *g_fw_health;
+        g_fw_health = &ctx->fw_health;
+        fprintf(stderr, "[brain] firmware health monitor initialized\n");
+    } else {
+        fprintf(stderr, "[brain] WARNING: firmware health init failed\n");
+    }
+
     /* Initialize mode state */
     /* Sprint 8: Initialize AP Database */
     if (ap_db_init(NULL) == 0) {
@@ -2586,6 +2738,14 @@ void brain_destroy(brain_ctx_t *ctx) {
     if (!ctx) return;
     
     brain_stop(ctx);
+
+    /* AUDIT FIX: Stop EAPOL monitor + cleanup fw_health */
+    eapol_monitor_stop(&ctx->eapol_mon);
+    {
+        extern fw_health_t *g_fw_health;
+        g_fw_health = NULL;
+    }
+
     
     /* Save Thompson brain state before destroying */
     if (ctx->stealth) {

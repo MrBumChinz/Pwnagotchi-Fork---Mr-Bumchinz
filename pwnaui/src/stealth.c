@@ -526,8 +526,30 @@ int stealth_rotate_mac(stealth_ctx_t *ctx) {
         /* On nexmon, wlan0 stays down while wlan0mon is active */
 
         if (ret != 0) {
-            fprintf(stderr, "[stealth] MAC rotation failed on base interface %s\n", base_iface);
-            return -1;
+            /* AUDIT FIX: Enhanced nexmon MAC change -- retry sequence */
+            /* Try cycling interface state before MAC change */
+            snprintf(cmd, sizeof(cmd), "ip link set %s up 2>/dev/null", base_iface);
+            exec_cmd(cmd);
+            usleep(100000);
+            snprintf(cmd, sizeof(cmd), "ip link set %s down 2>/dev/null", base_iface);
+            exec_cmd(cmd);
+            usleep(100000);
+            snprintf(cmd, sizeof(cmd), "ip link set %s address %s 2>/dev/null", base_iface, new_mac);
+            ret = exec_cmd(cmd);
+            if (ret != 0) {
+                /* Last resort: try on monitor interface directly */
+                snprintf(cmd, sizeof(cmd), "ip link set %s down 2>/dev/null", ctx->interface);
+                exec_cmd(cmd);
+                usleep(100000);
+                snprintf(cmd, sizeof(cmd), "ip link set %s address %s 2>/dev/null", ctx->interface, new_mac);
+                ret = exec_cmd(cmd);
+                snprintf(cmd, sizeof(cmd), "ip link set %s up 2>/dev/null", ctx->interface);
+                exec_cmd(cmd);
+            }
+            if (ret != 0) {
+                fprintf(stderr, "[stealth] MAC rotation failed on %s (nexmon locked)\n", base_iface);
+                return -1;
+            }
         }
 
         /* Verify using base interface MAC (wlan0mon always shows 00:00:00:00:00:00) */
