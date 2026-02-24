@@ -900,6 +900,19 @@ static void brain_epoch_callback(int epoch_num, const brain_epoch_t *data, void 
 
     fprintf(stderr, "[epoch] #%d uptime=%ds aps=%d\n", epoch_num, uptime_secs, ap_count);
 
+    /* Phase 2D: Increment walking/stationary session stats per epoch.
+     * These counters were declared and printed but never incremented,
+     * so walk_dump_stats() always reported 0 epochs, 0 scans, etc. */
+    if (g_brain_ctx) {
+        mobility_mode_t cur_mode = mobility_mode_get(&g_brain_ctx->mobility_ctx);
+        if (cur_mode == MOBILITY_WALKING && g_brain_ctx->walking.active) {
+            g_brain_ctx->walking.stats.epochs++;
+            g_brain_ctx->walking.stats.scans++;  /* 1 scan sweep per epoch */
+            g_brain_ctx->walking.stats.attacks_sent += data->num_deauths + data->num_assocs;
+            g_brain_ctx->walking.stats.unique_aps_seen = (uint32_t)ap_count;
+        }
+    }
+
     pthread_mutex_lock(&g_ui_mutex);
     snprintf(g_ui_state.uptime, sizeof(g_ui_state.uptime), "%02d:%02d:%02d:%02d", days, hours, mins, secs);
     snprintf(g_ui_state.aps, sizeof(g_ui_state.aps), "%d", ap_count);

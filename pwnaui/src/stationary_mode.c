@@ -60,6 +60,7 @@ void stat_session_start(stat_ctx_t *ctx)
 
 void stat_session_end(stat_ctx_t *ctx)
 {
+    if (!ctx->active) return;  /* Not started — don't print bogus stats */
     ctx->active = false;
     time_t elapsed = time(NULL) - ctx->session_start;
     if (elapsed < 1) elapsed = 1;

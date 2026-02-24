@@ -47,8 +47,11 @@ static double _gps_haversine(double lat1, double lon1, double lat2, double lon2)
     return 6371000.0 * 2.0 * atan2(sqrt(a), sqrt(1.0-a));
 }
 
-/* Timeout for marking GPS as disconnected (ms) */
-#define GPS_TIMEOUT_MS          5000
+/* Timeout for marking GPS as disconnected (ms).
+ * 15s allows Bluetooth PAN UDP gaps without losing fix status.
+ * The old 5s timeout caused has_fix=false 91% of the time during walks
+ * because a single UDP gap over Bluetooth wiped the fix. */
+#define GPS_TIMEOUT_MS          15000
 
 /* Forward declarations */
 static int get_interface_ip(const char *interface, char *ip_out, size_t ip_size);
@@ -491,9 +494,10 @@ int plugin_gps_handle_data(gps_data_t *data) {
                     );
 
                     /* Minimum distance threshold: GPS jitter is typically
-                     * 2-5m CEP. Over 5 seconds, jitter accumulates to ~8m.
-                     * Below this, report 0 speed to avoid phantom movement. */
-                    if (dist_m < 8.0 && dt_s < 6.0) {
+                     * 2-5m CEP. Walking speed (~5 km/h) covers ~6.5m in 5s,
+                     * so the old 8m threshold filtered out walking entirely.
+                     * Use 3m floor with 3s window to detect walking. */
+                    if (dist_m < 3.0 && dt_s < 3.0) {
                         data->speed_kmh = 0.0;
                     } else {
                         data->speed_kmh = (dist_m / dt_s) * 3.6;
@@ -537,6 +541,11 @@ int plugin_gps_update(gps_data_t *data) {
         if (now - data->last_nmea_ms > GPS_TIMEOUT_MS) {
             data->status = GPS_STATUS_DISCONNECTED;
             data->has_fix = false;
+            /* Reset haversine speed flag so GPVTG/GPRMC can seed
+             * on reconnect instead of using stale ring buffer data */
+            _gpgga_speed_valid = false;
+            _pos_ring_count = 0;
+            _pos_ring_idx = 0;
             strcpy(data->display, "GPS-");
             return 1;  /* Display needs update */
         }

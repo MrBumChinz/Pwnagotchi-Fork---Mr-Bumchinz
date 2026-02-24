@@ -50,6 +50,7 @@ void drv_session_start(drv_ctx_t *ctx)
 
 void drv_session_end(drv_ctx_t *ctx)
 {
+    if (!ctx->active) return;  /* Not started — don't print bogus stats */
     ctx->active = false;
     time_t elapsed = time(NULL) - ctx->session_start;
     if (elapsed < 1) elapsed = 1;

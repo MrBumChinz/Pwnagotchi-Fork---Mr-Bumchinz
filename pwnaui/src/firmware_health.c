@@ -237,6 +237,20 @@ void fw_health_report_failure(fw_health_t *fwh) {
 
     /* Check escalation thresholds */
     if (fwh->consecutive_failures >= FW_HEALTH_FAIL_RESET) {
+        /* Don't reset if we just reset recently — prevents death loop.
+         * During the walk test this fired 86 times in a row. */
+        time_t now_t = time(NULL);
+        if (fwh->last_reset > 0 && (now_t - fwh->last_reset) < FW_HEALTH_RESET_COOLDOWN_S) {
+            /* Too soon after last reset — just back off, don't reset again */
+            fwh->consecutive_failures = 0;
+            fw_log(fwh, "SUPPRESSED: reset cooldown (%ds since last)",
+                   (int)(now_t - fwh->last_reset));
+            fprintf(stderr, "[fw_health] SUPPRESSED: reset too recent (%ds ago)\n",
+                    (int)(now_t - fwh->last_reset));
+            pthread_mutex_unlock(&fwh->lock);
+            return;
+        }
+
         /* Catastrophic — force interface reset */
         fw_log(fwh, "CRITICAL: %d consecutive failures — triggering reset",
                fwh->consecutive_failures);

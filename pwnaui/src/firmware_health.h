@@ -45,7 +45,8 @@
 #define FW_HEALTH_BACKOFF_DIVISOR    2   /* Halve on consecutive failures */
 #define FW_HEALTH_RAMP_INCREMENT     5   /* Increase by 5 on sustained success */
 #define FW_HEALTH_RAMP_THRESHOLD    10   /* Consecutive successes before ramp */
-#define FW_HEALTH_FAIL_RESET         3   /* Consecutive failures → force reset */
+#define FW_HEALTH_FAIL_RESET        10   /* Consecutive failures → force reset (was 3, too aggressive) */
+#define FW_HEALTH_RESET_COOLDOWN_S  30   /* Don't reset again within 30s of last reset */
 
 /* Pre-emptive cooldown */
 #define FW_HEALTH_FRAMES_BEFORE_COOLDOWN  1000  /* Total frames → schedule rest */
