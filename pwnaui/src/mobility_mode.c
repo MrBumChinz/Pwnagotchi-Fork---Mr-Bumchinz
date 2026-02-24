@@ -72,35 +72,38 @@ static const mobility_params_t MODE_PARAMS[MOBILITY_MODE_COUNT] = {
 /**
  * Classify inputs into a mobility mode.
  *
- * GPS speed is primary signal when it's clearly moving.
- * When GPS speed is near-zero, AP churn acts as a tiebreaker —
- * haversine position-differencing can't resolve walking speed
- * (~5 km/h) from GPS jitter (~5m CEP), so "speed=0" doesn't
- * necessarily mean stationary.
+ * GPS Doppler speed is the PRIMARY and AUTHORITATIVE signal.
+ * When GPS has a fix, its speed reading vetoes AP churn:
+ *   - speed > 15 = DRIVING
+ *   - speed > 1.5 = WALKING 
+ *   - speed <= 1.5 = STATIONARY (churn CANNOT override)
+ *
+ * AP churn is ONLY used when there is NO GPS fix (speed < 0).
+ * Churn from scan variance (3→5→3 APs at home) caused constant
+ * false WALKING with the old logic that let churn override GPS.
  */
-static mobility_mode_t classify(float gps_speed, float mob_score, float ap_churn) {
-    /* GPS clearly says driving — trust it unconditionally */
-    if (gps_speed > MOB_SPEED_DRIVING) {
-        return MOBILITY_DRIVING;
+static mobility_mode_t classify(float gps_speed, float mob_score, float ap_churn, int total_aps) {
+    /* GPS Doppler is available (>= 0) — trust it absolutely */
+    if (gps_speed >= 0.0f) {
+        if (gps_speed > MOB_SPEED_DRIVING) return MOBILITY_DRIVING;
+        if (gps_speed > MOB_SPEED_WALKING) return MOBILITY_WALKING;
+        /* GPS says < 1.5 km/h = STATIONARY. Period.
+         * Do NOT let AP churn override — it's noise at home. */
+        return MOBILITY_STATIONARY;
     }
 
-    /* GPS clearly says walking speed — trust it */
-    if (gps_speed > MOB_SPEED_WALKING) {
-        return MOBILITY_WALKING;
+    /* No GPS fix (speed < 0). AP churn is the only signal.
+     * Require minimum AP count to avoid noise from 2-3 APs. */
+    if (total_aps >= MOB_MIN_APS_FOR_CHURN) {
+        if (ap_churn > MOB_CHURN_DRIVING && mob_score > 0.5f) {
+            return MOBILITY_DRIVING;
+        }
+        if (ap_churn > MOB_CHURN_WALKING && mob_score > 0.15f) {
+            return MOBILITY_WALKING;
+        }
     }
 
-    /* GPS speed is low or missing. AP churn can override.
-     * This handles both:
-     *   (a) GPS has fix but speed=0.0 (haversine can't detect walking)
-     *   (b) No GPS fix (speed < 0)  */
-    if (ap_churn > MOB_CHURN_DRIVING && mob_score > 0.5f) {
-        return MOBILITY_DRIVING;
-    }
-    if (ap_churn > MOB_CHURN_WALKING && mob_score > 0.15f) {
-        return MOBILITY_WALKING;
-    }
-
-    /* Both GPS and AP churn agree: not moving */
+    /* No GPS, insufficient APs for churn — assume stationary */
     return MOBILITY_STATIONARY;
 }
 
@@ -153,13 +156,19 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
         gps_speed = -1.0f;  /* Treat as no-GPS for this reading */
     }
 
-    /* EMA speed smoothing: dampens GPS noise spikes.
-     * Only smooth valid GPS readings (>= 0).
-     * On first valid reading, seed the EMA. */
+    /* Asymmetric EMA speed smoothing:
+     * - Upward (accelerating): use MOB_SPEED_SMOOTH_ALPHA (0.9) — fast but dampens spikes
+     * - Downward (decelerating): snap immediately to raw speed.
+     *   When GPS Doppler says 0, the user STOPPED. Don't let the EMA
+     *   ghost at 8+ km/h for several readings causing false WLK. */
     float smoothed = gps_speed;
     if (gps_speed >= 0.0f) {
         if (ctx->smoothed_speed < 0.0f) {
             /* First valid GPS reading — seed EMA */
+            ctx->smoothed_speed = gps_speed;
+        } else if (gps_speed < ctx->smoothed_speed * 0.5f) {
+            /* Speed dropped by >50% — user stopped or braked hard.
+             * Snap to raw immediately, don't ghost. */
             ctx->smoothed_speed = gps_speed;
         } else {
             ctx->smoothed_speed = MOB_SPEED_SMOOTH_ALPHA * gps_speed
@@ -169,7 +178,7 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
     }
 
     /* Use smoothed speed for classification, not raw */
-    mobility_mode_t detected = classify(smoothed, mob_score, ap_churn);
+    mobility_mode_t detected = classify(smoothed, mob_score, ap_churn, total_aps);
 
     /* Debug log every update for field diagnosis */
     {
@@ -210,17 +219,16 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
         ctx->pending_count = 1;
     }
 
-            /* Hysteresis: always require multiple consecutive readings.
-     * Never use threshold=1 — GPS noise can produce single-reading spikes.
-     * With EMA smoothing the speed is already dampened, but we still
-     * want at least GPS_HYSTERESIS (3) readings for GPS-based switches
-     * and HYSTERESIS_COUNT (5) for AP-churn-only fallback. */
+            /* Hysteresis: GPS Doppler speed is authoritative and arrives at 1Hz.
+     * With EMA alpha=0.9, smoothed speed tracks within 1 reading.
+     * Use GPS_HYSTERESIS (1) for GPS-based switches (instant).
+     * Use HYSTERESIS_COUNT (3) for AP-churn-only fallback which is noisy. */
     int threshold;
     if (gps_speed < 0.0f) {
         /* No GPS fix -- AP churn fallback is noisy */
         threshold = MOB_HYSTERESIS_COUNT;
     } else {
-        /* GPS present -- still require multiple readings */
+        /* GPS Doppler present -- trust it immediately */
         threshold = MOB_GPS_HYSTERESIS;
     }
     if (ctx->pending_count >= threshold) {

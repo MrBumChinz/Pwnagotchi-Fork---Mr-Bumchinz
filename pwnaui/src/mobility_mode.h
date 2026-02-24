@@ -29,25 +29,26 @@
  * ============================================================================ */
 
 /* Hysteresis: consecutive readings before mode switch */
-#define MOB_HYSTERESIS_COUNT    5      /* AP-churn-only fallback: require 5 readings */
-#define MOB_GPS_HYSTERESIS      3      /* GPS-confirmed: require 3 consecutive readings */
+#define MOB_HYSTERESIS_COUNT    3      /* AP-churn-only fallback: 3 readings */
+#define MOB_GPS_HYSTERESIS      1      /* GPS-confirmed: instant (Doppler is reliable at 1Hz) */
 
 /* GPS speed thresholds (km/h) */
 #define MOB_SPEED_DRIVING       15.0    /* > 15 km/h = driving */
-#define MOB_SPEED_WALKING        2.0    /* 2-15 km/h = walking */
-                                        /* < 2 km/h = stationary */
+#define MOB_SPEED_WALKING        1.5    /* 1.5-15 km/h = walking (was 2.0, missed slow walks) */
+                                        /* < 1.5 km/h = stationary */
 
 /* Speed smoothing: EMA alpha (higher = more reactive)
- * At 0.7, speed responds in ~2 readings instead of ~5.
- * Walking speed needs fast detection since walks are short. */
-#define MOB_SPEED_SMOOTH_ALPHA  0.7f   /* Reactive EMA: ~2 reading window */
+ * At 0.9, speed tracks GPS within 1 reading.
+ * Doppler speed is already filtered by the receiver chip. */
+#define MOB_SPEED_SMOOTH_ALPHA  0.9f   /* Near-instant tracking: 1 reading to converge */
 #define MOB_SPEED_MAX_SANE      120.0f  /* Reject GPS > 120 km/h as noise */
-#define MOB_SWITCH_COOLDOWN_S   10      /* Min 10s between mode switches */
+#define MOB_SWITCH_COOLDOWN_S   5       /* Min 5s between mode switches (was 8) */
 
 /* AP churn thresholds (fraction of total APs changed per check) */
-#define MOB_CHURN_DRIVING        0.7    /* > 70% AP turnover = driving */
-#define MOB_CHURN_WALKING        0.3    /* 30-70% = walking */
-                                        /* < 30% = stationary */
+#define MOB_CHURN_DRIVING        0.6    /* > 60% AP turnover = driving */
+#define MOB_CHURN_WALKING        0.25   /* 25-60% = walking (raised from 0.15 — too sensitive at low AP count) */
+                                        /* < 25% = stationary */
+#define MOB_MIN_APS_FOR_CHURN    5      /* Need >= 5 APs for churn to be meaningful */
 
 /* Mode-specific parameters */
 
