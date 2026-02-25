@@ -86,17 +86,17 @@ static mobility_mode_t classify(float gps_speed, float mob_score, float ap_churn
         if (gps_speed > MOB_SPEED_DRIVING) return MOBILITY_DRIVING;
         if (gps_speed > MOB_SPEED_WALKING) return MOBILITY_WALKING;
 
-        /* GPS says < 1.5 km/h but accelerometer shows motion?
+        /* GPS says < 1.5 km/h but accelerometer shows walking motion?
          * This happens when Samsung Doppler reports 0 at walking speed.
-         * Trust the accelerometer as a tiebreaker. */
-        if (accel > MOB_ACCEL_DRIVING) return MOBILITY_DRIVING;
+         * Accel can only trigger WLK, NEVER DRV — phone handling/pickup
+         * generates 3-5 m/s² which is indistinguishable from driving. */
         if (accel > MOB_ACCEL_WALKING) return MOBILITY_WALKING;
 
         return MOBILITY_STATIONARY;
     }
 
-    /* No GPS fix (speed < 0). Check accelerometer first, then AP churn. */
-    if (accel > MOB_ACCEL_DRIVING) return MOBILITY_DRIVING;
+    /* No GPS fix (speed < 0). Check accelerometer for walking, then AP churn.
+     * Accel CANNOT trigger DRV — only GPS speed > 10 km/h can. */
     if (accel > MOB_ACCEL_WALKING) return MOBILITY_WALKING;
 
     /* AP churn is the fallback signal.
@@ -157,10 +157,24 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
     ctx->mobility_score = mob_score;
     ctx->ap_churn_rate = ap_churn;
     ctx->total_aps = total_aps;
-    ctx->accel_magnitude = accel;
     ctx->prev_step_count = ctx->step_count;
     ctx->step_count = steps;
     ctx->last_check = now;
+
+    /* Accel staleness detection: if the accelerometer value hasn't changed
+     * between readings, it means the phone isn't sending fresh data (BT dropout,
+     * app backgrounded, etc.).  After 2 consecutive stale readings, zero it out
+     * so stale high values don't sustain false WLK/DRV. */
+    if (fabsf(accel - ctx->prev_accel) < 0.005f && accel > 0.05f) {
+        ctx->accel_stale_count++;
+        if (ctx->accel_stale_count >= 2) {
+            accel = 0.0f;  /* Stale — ignore */
+        }
+    } else {
+        ctx->accel_stale_count = 0;
+    }
+    ctx->prev_accel = accel;
+    ctx->accel_magnitude = accel;
 
     /* GPS speed sanity clamp: reject absurd readings as noise */
     if (gps_speed > MOB_SPEED_MAX_SANE) {

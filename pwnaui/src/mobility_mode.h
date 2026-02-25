@@ -52,9 +52,11 @@
                                         /* < 25% = stationary */
 #define MOB_MIN_APS_FOR_CHURN    5      /* Need >= 5 APs for churn to be meaningful */
 
-/* Accelerometer thresholds for motion detection (m/s² RMS) */
-#define MOB_ACCEL_WALKING       0.4f    /* > 0.4 m/s² = walking motion */
-#define MOB_ACCEL_DRIVING       1.5f    /* > 1.5 m/s² = vehicle vibration */
+/* Accelerometer thresholds for motion detection (m/s² RMS)
+ * NOTE: Accel can only trigger WLK (walking), NEVER DRV (driving).
+ * Phone pickup/handling generates 3-5 m/s² which overlaps with driving.
+ * Only GPS speed > 10 km/h can trigger DRV. */
+#define MOB_ACCEL_WALKING       0.8f    /* > 0.8 m/s² RMS = walking motion (raised from 0.4 to avoid phone-pickup false positives) */
 
 /* Mode-specific parameters */
 
@@ -122,6 +124,8 @@ typedef struct {
     float gps_speed_kmh;                /* Latest GPS speed */
     float smoothed_speed;               /* EMA-smoothed GPS speed */
     float accel_magnitude;              /* Phone accelerometer RMS (m/s²), 0=still */
+    float prev_accel;                   /* Previous accel value (staleness detection) */
+    int   accel_stale_count;            /* Consecutive readings with unchanged accel */
     int   step_count;                   /* Phone step counter (cumulative) */
     int   prev_step_count;              /* Previous step count for delta */
     float mobility_score;               /* Latest brain mobility_score */
