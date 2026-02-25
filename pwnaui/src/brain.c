@@ -2017,6 +2017,7 @@ static void *brain_thread_func(void *arg) {
                 channel_counts[channels[i]] = ordered_ap_counts[i];
             }
             num_channels = ordered_idx;
+        }
             
         /* Phase 1D: Apply channel_map yield-sorted order (overrides Thompson when available) */
         {
@@ -2058,12 +2059,11 @@ static void *brain_thread_func(void *arg) {
                 (ctx->epoch.epoch_num % 8 == 4) ? "DISASSOC" :
                 (ctx->epoch.epoch_num % 8 == 5) ? "ROGUE_M2" :
                 (ctx->epoch.epoch_num % 8 == 6) ? "PROBE" : "LISTEN");
-            fprintf(stderr, "[brain] channel order (Thompson): ");
-            for (int i = 0; i < num_channels; i++) {
-                fprintf(stderr, "ch%d(%d) ", channels[i], channel_counts[channels[i]]);
-            }
-            fprintf(stderr, "\n");
+        fprintf(stderr, "[brain] channel order (Thompson): ");
+        for (int i = 0; i < num_channels; i++) {
+            fprintf(stderr, "ch%d(%d) ", channels[i], channel_counts[channels[i]]);
         }
+        fprintf(stderr, "\n");
         
         /* Fire attack phase callback for UI — but only if we actually have targets.
          * If all APs are conquered, skip the callback so the mood (BORED)
@@ -2073,6 +2073,79 @@ static void *brain_thread_func(void *arg) {
             int _ui_phase = ctx->epoch.epoch_num % 8;
             if (ctx->on_attack_phase) {
                 ctx->on_attack_phase(_ui_phase, ctx->callback_user_data);
+            }
+        }
+
+        /* ── Phase 2B: Driving mode sweep lifecycle ─────────────── */
+        if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING && ctx->driving.active) {
+            drv_sweep_begin(&ctx->driving);
+            /* Override channel order with driving mode's optimized 1/6/11-first order */
+            int drv_channels[DRV_MAX_CHANNELS];
+            int drv_ch_count = 0;
+            drv_get_channel_order(&ctx->driving, drv_channels, &drv_ch_count);
+            /* Replace channel list: only use channels visible in scan */
+            int drv_final[DRV_MAX_CHANNELS];
+            int drv_final_count = 0;
+            for (int di = 0; di < drv_ch_count; di++) {
+                for (int si = 0; si < num_channels; si++) {
+                    if (channels[si] == drv_channels[di]) {
+                        drv_final[drv_final_count++] = drv_channels[di];
+                        break;
+                    }
+                }
+            }
+            if (drv_final_count > 0) {
+                for (int di = 0; di < drv_final_count; di++)
+                    channels[di] = drv_final[di];
+                num_channels = drv_final_count;
+            }
+        }
+
+        /* ── Phase 2D: Walking mode epoch + secondary channel learning ── */
+        if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING && ctx->walking.active) {
+            ctx->walking.stats.epochs++;
+            ctx->walking.stats.scans++;
+            /* Override channel list with walking mode's primary + learned secondaries */
+            uint8_t walk_ch_buf[WALK_NUM_PRIMARY + WALK_SECONDARY_MAX];
+            int walk_ch_count = walk_get_scan_channels(&ctx->walking, walk_ch_buf,
+                                                       WALK_NUM_PRIMARY + WALK_SECONDARY_MAX);
+            if (walk_ch_count > 0) {
+                /* Merge: walking channels first, then any remaining scan channels */
+                int merged[BRAIN_MAX_CHANNELS];
+                int merged_count = 0;
+                for (int wi = 0; wi < walk_ch_count && merged_count < BRAIN_MAX_CHANNELS; wi++) {
+                    /* Only include if actually seen in scan */
+                    for (int si = 0; si < num_channels; si++) {
+                        if (channels[si] == (int)walk_ch_buf[wi]) {
+                            merged[merged_count++] = (int)walk_ch_buf[wi];
+                            break;
+                        }
+                    }
+                }
+                /* Append remaining channels not already in merged */
+                for (int si = 0; si < num_channels && merged_count < BRAIN_MAX_CHANNELS; si++) {
+                    bool already = false;
+                    for (int mi = 0; mi < merged_count; mi++) {
+                        if (merged[mi] == channels[si]) { already = true; break; }
+                    }
+                    if (!already) merged[merged_count++] = channels[si];
+                }
+                for (int mi = 0; mi < merged_count; mi++)
+                    channels[mi] = merged[mi];
+                num_channels = merged_count;
+            }
+        }
+
+        /* ── Phase 2C: Stationary mode phase gating ────────────────────── */
+        bool stat_soak_active = false;
+        if (ctx->mobility_ctx.current_mode == MOBILITY_STATIONARY && ctx->stationary.active) {
+            if (ctx->stationary.phase == STAT_PHASE_SOAK || ctx->stationary.permanent_soak) {
+                /* SOAK phase: zero injection, just listen for EAPOL completions */
+                stat_soak_active = true;
+                fprintf(stderr, "[brain] [stationary] SOAK phase — passive listen only\n");
+            } else if (ctx->stationary.phase == STAT_PHASE_SCAN) {
+                /* SCAN phase: just observe, don't attack (building triage list) */
+                fprintf(stderr, "[brain] [stationary] SCAN phase — observing\n");
             }
         }
 
@@ -2088,6 +2161,12 @@ static void *brain_thread_func(void *arg) {
             /* Get APs on this channel */
             ctx->aps_on_channel = channel_counts[ch];
             
+            /* Phase 2B: Driving mode per-channel entry */
+            int drv_dwell_ms = 0;
+            if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING && ctx->driving.active) {
+                drv_dwell_ms = drv_enter_channel(&ctx->driving, ch);
+            }
+
             /* Build candidate list for Thompson Sampling */
             ts_entity_t *candidates[64];
             int candidate_count = 0;
@@ -2250,10 +2329,19 @@ static void *brain_thread_func(void *arg) {
                     }
 
                     /* Phase 2D: Walking mode — proximity alerts + target tracking */
-                    if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING) {
-                        walk_update_target(&ctx->walking, mac_str, ap.ssid,
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING && ctx->walking.active) {
+                        walk_target_t *_wt = walk_update_target(&ctx->walking, mac_str, ap.ssid,
                                           (int8_t)ap.rssi, ap.channel, ap.clients_count,
                                           (_hs_q == HS_QUALITY_FULL));
+                        if (_wt) {
+                            /* Feed triage score from AP triage system */
+                            brain_attack_tracker_t *_watrk = get_attack_tracker(ctx, mac_str);
+                            if (_watrk) {
+                                rssi_trend_info_t _wrti;
+                                rssi_trend_classify(&_watrk->rssi_trend, &_wrti);
+                                _wt->strategy = walk_get_strategy(_wrti.trend);
+                            }
+                        }
                         if (walk_check_proximity(&ctx->walking, mac_str, ap.ssid,
                                                  (int8_t)ap.rssi, ap.clients_count)) {
                             brain_set_mood(ctx, MOOD_JACKPOT);
@@ -2262,8 +2350,8 @@ static void *brain_thread_func(void *arg) {
                         }
                     }
 
-                    /* Phase 2B: Driving mode — GPS breadcrumb for every AP seen */
-                    if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING) {
+                    /* Phase 2B: Driving mode — GPS breadcrumb + association filter */
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING && ctx->driving.active) {
                         double _blat = 0.0, _blon = 0.0;
                         if (ctx->gps && ctx->gps->has_fix) {
                             _blat = ctx->gps->latitude;
@@ -2272,6 +2360,33 @@ static void *brain_thread_func(void *arg) {
                         drv_add_breadcrumb(&ctx->driving, mac_str, ap.ssid,
                                           (int8_t)ap.rssi, ap.channel,
                                           _blat, _blon, false);
+                        /* Use driving mode's association filter (skip weak, already-captured, etc.) */
+                        bool _pmkid_avail = (_hs_q == HS_QUALITY_PMKID);
+                        if (!drv_should_associate(&ctx->driving, ap.channel,
+                                                 (int8_t)ap.rssi, (_hs_q == HS_QUALITY_FULL),
+                                                 _pmkid_avail)) {
+                            /* Driving filter rejected — skip this AP as candidate */
+                            if (candidate_count > 0 && candidates[candidate_count - 1] == entity)
+                                candidate_count--;
+                        }
+                    }
+
+                    /* Phase 2C: Stationary mode — feed EAPOL state for circle-back tracking */
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_STATIONARY && ctx->stationary.active) {
+                        /* Check EAPOL monitor for M1/M2 state on this BSSID */
+                        uint8_t _sbssid[6];
+                        memcpy(_sbssid, ap.bssid.addr, 6);
+                        eapol_state_t _estate = eapol_monitor_get_state(&ctx->eapol_mon, _sbssid);
+                        bool _s_has_m1 = (_estate >= EAPOL_STATE_M1);
+                        bool _s_has_m2 = (_estate >= EAPOL_STATE_M1M2);
+                        stat_record_eapol_state(&ctx->stationary, mac_str, _s_has_m1, _s_has_m2);
+
+                        /* During CIRCLE phase, boost circle-back candidates */
+                        if (ctx->stationary.phase == STAT_PHASE_CIRCLE &&
+                            stat_is_circle_back(&ctx->stationary, mac_str) && entity) {
+                            entity->client_boost += 2.0f;  /* Strong boost for M1-only APs */
+                            fprintf(stderr, "[brain] [stat-circle] %s: M1 only, boosting for circle-back\n", ap.ssid);
+                        }
                     }
 
                     /* Boost score for APs with clients (better handshake targets) */
@@ -2352,6 +2467,15 @@ static void *brain_thread_func(void *arg) {
             if (ctx->current_mode == MODE_COOLDOWN) {
                 sleep(3);
                 /* fall through */
+            }
+
+            /* Phase 2C: Stationary SOAK/SCAN phase — skip attacks entirely */
+            if (stat_soak_active || (ctx->mobility_ctx.current_mode == MOBILITY_STATIONARY &&
+                ctx->stationary.active && ctx->stationary.phase == STAT_PHASE_SCAN)) {
+                /* In SOAK: passive listen only. In SCAN: observe only, build triage list. */
+                int listen_ms = stat_soak_active ? 2000 : 500;
+                usleep(listen_ms * 1000);
+                continue;  /* Next channel — no attacks */
             }
 
 
@@ -2469,6 +2593,52 @@ static void *brain_thread_func(void *arg) {
                                         ap.ssid, _rpri);
                             }
                             priority *= _rpri;
+                        }
+                    }
+
+                    /* Phase 2D: Walking mode — use walk_get_strategy() to influence attack type */
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING && ctx->walking.active && ap_tracker) {
+                        rssi_trend_info_t _wstrat_info;
+                        rssi_trend_t _wtrend = rssi_trend_classify(&ap_tracker->rssi_trend, &_wstrat_info);
+                        walk_attack_strategy_t _wstrat = walk_get_strategy(_wtrend);
+                        switch (_wstrat) {
+                            case WALK_ATTACK_PMKID_ONLY:
+                                /* Approaching: PMKID only, save deauth for peak */
+                                if (attack_phase != 0 && attack_phase != 7) {
+                                    attack_phase = 0;
+                                }
+                                break;
+                            case WALK_ATTACK_FULL_BURST:
+                                /* At peak: use whatever Thompson selected — all weapons */
+                                break;
+                            case WALK_ATTACK_FINAL_SHOT:
+                                /* Departing: one last deauth attempt */
+                                if (attack_phase != 2 && ap.clients_count > 0) {
+                                    attack_phase = 2;  /* Force targeted deauth */
+                                }
+                                break;
+                        }
+                    }
+
+                    /* Phase 2C: Stationary mode — override attack phase with rotation system */
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_STATIONARY && ctx->stationary.active) {
+                        if (ctx->stationary.phase == STAT_PHASE_BURST ||
+                            ctx->stationary.phase == STAT_PHASE_CIRCLE) {
+                            stat_attack_type_t _sat = stat_get_attack_type(&ctx->stationary, mac_str);
+                            /* Map stationary attack type to brain attack phase */
+                            switch (_sat) {
+                                case STAT_ATK_DEAUTH_BIDI:  attack_phase = 2; break;  /* Targeted deauth */
+                                case STAT_ATK_CSA_BEACON:   attack_phase = 1; break;  /* CSA */
+                                case STAT_ATK_PMKID_ASSOC:  attack_phase = 0; break;  /* PMKID */
+                                case STAT_ATK_DEAUTH_BCAST: attack_phase = 2; break;  /* Deauth (broadcast variant) */
+                                case STAT_ATK_DISASSOC:     attack_phase = 4; break;  /* Disassociation */
+                                default: break;  /* Keep Thompson selection */
+                            }
+                            /* Only use phases that are globally enabled */
+                            if (!ctx->config.attack_phase_enabled[attack_phase] && ap_tracker) {
+                                attack_phase = select_attack_phase(ap_tracker, ap_tracker->is_wpa3,
+                                                                   ctx->config.attack_phase_enabled);
+                            }
                         }
                     }
 
@@ -2699,6 +2869,47 @@ static void *brain_thread_func(void *arg) {
                         brain_track_deauth(ctx, mac_str);
                     }
 
+                    /* Phase 2B: Driving mode — record association for sweep tracking */
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING &&
+                        ctx->driving.active && did_assoc_this_ch > 0) {
+                        drv_record_association(&ctx->driving, ap.channel,
+                                              mac_str, (int8_t)ap.rssi);
+                    }
+
+                    /* Phase 2D: Walking mode — record attack with strategy */
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING &&
+                        ctx->walking.active &&
+                        (did_deauth_this_ch > 0 || did_assoc_this_ch > 0)) {
+                        walk_target_t *_wt2 = NULL;
+                        /* Determine strategy from current trend */
+                        walk_attack_strategy_t _ws = WALK_ATTACK_PMKID_ONLY;
+                        if (ap_tracker) {
+                            rssi_trend_info_t _wri2;
+                            rssi_trend_t _wtr2 = rssi_trend_classify(&ap_tracker->rssi_trend, &_wri2);
+                            _ws = walk_get_strategy(_wtr2);
+                        }
+                        walk_record_attack(&ctx->walking, mac_str, _ws);
+                    }
+
+                    /* Phase 2C: Stationary mode — record attack for rotation tracking */
+                    if (ctx->mobility_ctx.current_mode == MOBILITY_STATIONARY &&
+                        ctx->stationary.active &&
+                        (did_deauth_this_ch > 0 || did_assoc_this_ch > 0)) {
+                        /* Map attack_phase back to stat_attack_type_t */
+                        stat_attack_type_t _stype = STAT_ATK_PMKID_ASSOC;
+                        switch (attack_phase) {
+                            case 0: _stype = STAT_ATK_PMKID_ASSOC; break;
+                            case 1: _stype = STAT_ATK_CSA_BEACON; break;
+                            case 2: _stype = STAT_ATK_DEAUTH_BIDI; break;
+                            case 3: _stype = STAT_ATK_DEAUTH_BIDI; break;  /* PMF bypass → deauth variant */
+                            case 4: _stype = STAT_ATK_DISASSOC; break;
+                            case 5: _stype = STAT_ATK_DEAUTH_BCAST; break; /* Rogue M2 */
+                            default: break;
+                        }
+                        stat_record_attack(&ctx->stationary, mac_str, _stype, false);
+                        /* Success is recorded later if handshake is captured */
+                    }
+
                     break;  /* Found the AP, move to next candidate */
                 }
             }
@@ -2716,6 +2927,11 @@ static void *brain_thread_func(void *arg) {
             if (did_deauth_this_ch > 0 || did_assoc_this_ch > 0) {
                 int dwell_ms = channel_map_get_listen_ms(&ctx->channel_map, ch);
                 if (dwell_ms <= 0) dwell_ms = ctx->config.hop_recon_time * 1000;
+                /* Phase 2B: Driving mode uses fast 50ms dwell, not yield-based */
+                if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING &&
+                    ctx->driving.active && drv_dwell_ms > 0) {
+                    dwell_ms = drv_dwell_ms;
+                }
                 fprintf(stderr, "[brain] waiting %dms before hop to ch %d (yield-dwell)\n",
                         dwell_ms, (c + 1 < num_channels) ?
                         channels[c + 1] : channels[0]);
@@ -2723,6 +2939,39 @@ static void *brain_thread_func(void *arg) {
             }
         }
         
+        /* ── Phase 2B: Driving mode sweep end + cycle tracking ────────── */
+        if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING && ctx->driving.active) {
+            drv_sweep_end(&ctx->driving);
+            if (drv_check_cycle(&ctx->driving)) {
+                /* New 10-second cycle — dump performance stats */
+                drv_dump_stats(&ctx->driving);
+            }
+        }
+
+        /* ── Phase 2D: Walking mode — learn secondary channels from Thompson ── */
+        if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING && ctx->walking.active) {
+            /* Feed channel bandit scores to walking mode's secondary channel learning */
+            if (ctx->epoch.epoch_num % 10 == 0 && num_channels > 0) {
+                uint8_t _wl_ch[BRAIN_MAX_CHANNELS];
+                float _wl_scores[BRAIN_MAX_CHANNELS];
+                int _wl_count = 0;
+                for (int wi = 0; wi < num_channels && _wl_count < BRAIN_MAX_CHANNELS; wi++) {
+                    int _wch = channels[wi];
+                    _wl_ch[_wl_count] = (uint8_t)_wch;
+                    /* Get Thompson success ratio for this channel */
+                    if (_wch >= 1 && _wch <= CB_MAX_CHANNELS) {
+                        float _wa = ctx->channel_bandit.channels[_wch].alpha;
+                        float _wb = ctx->channel_bandit.channels[_wch].beta;
+                        _wl_scores[_wl_count] = (_wa + _wb > 0) ? _wa / (_wa + _wb) : 0.0f;
+                    } else {
+                        _wl_scores[_wl_count] = 0.0f;
+                    }
+                    _wl_count++;
+                }
+                walk_learn_secondary_channels(&ctx->walking, _wl_ch, _wl_scores, _wl_count);
+            }
+        }
+
         /* If no activity this epoch, wait before next epoch */
         if (!ctx->epoch.any_activity) {
             int wait_secs = ctx->config.recon_time;
@@ -2766,8 +3015,25 @@ static void *brain_thread_func(void *arg) {
                     /* Phase 2: Notify mode pipeline of capture */
                     if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING)
                         walk_record_capture(&ctx->walking, ctx->pending_attack_mac);
-                    else if (ctx->mobility_ctx.current_mode == MOBILITY_STATIONARY)
+                    else if (ctx->mobility_ctx.current_mode == MOBILITY_STATIONARY) {
                         stat_record_capture(&ctx->stationary);
+                        /* Mark the attack that led to capture as successful */
+                        brain_attack_tracker_t *_sat_trk = get_attack_tracker(ctx, ctx->pending_attack_mac);
+                        if (_sat_trk && _sat_trk->last_attack_phase >= 0) {
+                            stat_attack_type_t _stype_ok = STAT_ATK_PMKID_ASSOC;
+                            switch (_sat_trk->last_attack_phase) {
+                                case 0: _stype_ok = STAT_ATK_PMKID_ASSOC; break;
+                                case 1: _stype_ok = STAT_ATK_CSA_BEACON; break;
+                                case 2: _stype_ok = STAT_ATK_DEAUTH_BIDI; break;
+                                case 4: _stype_ok = STAT_ATK_DISASSOC; break;
+                                default: break;
+                            }
+                            stat_record_attack(&ctx->stationary, ctx->pending_attack_mac, _stype_ok, true);
+                        }
+                    } else if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING) {
+                        /* Record PMKID capture on the channel we got it */
+                        if (w) drv_record_pmkid(&ctx->driving, w->channel);
+                    }
 
                     fprintf(stderr, "[brain] HANDSHAKE! %s rewarded (ch%d, mode=%s)\n", 
                             ctx->pending_attack_mac, 
@@ -2908,7 +3174,7 @@ static void *brain_thread_func(void *arg) {
 
 
         /* Phase 2C: Stationary diminishing returns check */
-        if (ctx->mobility_ctx.current_mode == MOBILITY_STATIONARY) {
+        if (ctx->mobility_ctx.current_mode == MOBILITY_STATIONARY && ctx->stationary.active) {
             if (ctx->epoch.num_shakes > 0) {
                 for (int _sc = 0; _sc < ctx->epoch.num_shakes; _sc++)
                     stat_record_capture(&ctx->stationary);
@@ -2920,20 +3186,49 @@ static void *brain_thread_func(void *arg) {
             /* Check phase expiry and advance */
             if (stat_phase_expired(&ctx->stationary)) {
                 stat_phase_t _new_phase = stat_advance_phase(&ctx->stationary);
-                fprintf(stderr, "[brain] [stationary] Phase -> %s\n", stat_phase_name(_new_phase));
+                fprintf(stderr, "[brain] [stationary] Phase -> %s (circle_back=%d, stale=%d)\n",
+                        stat_phase_name(_new_phase),
+                        stat_get_circle_back_count(&ctx->stationary),
+                        ctx->stationary.consecutive_stale);
                 if (_new_phase == STAT_PHASE_SOAK) {
                     brain_set_mood(ctx, MOOD_SOAKING);
                 } else if (_new_phase == STAT_PHASE_BURST) {
                     brain_set_mood(ctx, MOOD_HUNTING);
+                } else if (_new_phase == STAT_PHASE_CIRCLE) {
+                    brain_set_mood(ctx, MOOD_HUNTING);
+                    fprintf(stderr, "[brain] [stationary] Circle-back: %d APs with M1 but no M2\n",
+                            stat_get_circle_back_count(&ctx->stationary));
                 }
+            }
+            /* Periodic stats dump every 20 epochs */
+            if (ctx->epoch.epoch_num % 20 == 0) {
+                stat_dump_stats(&ctx->stationary);
             }
         }
 
         /* Phase 2D: Walking GPS breadcrumb per epoch */
-        if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING && ctx->gps && ctx->gps->has_fix) {
-            walk_breadcrumb(&ctx->walking, ctx->gps->latitude, ctx->gps->longitude,
-                           (uint16_t)ctx->total_aps);
+        if (ctx->mobility_ctx.current_mode == MOBILITY_WALKING && ctx->walking.active) {
+            if (ctx->gps && ctx->gps->has_fix) {
+                walk_breadcrumb(&ctx->walking, ctx->gps->latitude, ctx->gps->longitude,
+                               (uint16_t)ctx->total_aps);
+            }
             walk_proximity_tick(&ctx->walking);
+            /* Periodic stats dump every 20 epochs */
+            if (ctx->epoch.epoch_num % 20 == 0) {
+                walk_dump_stats(&ctx->walking);
+            }
+        }
+
+        /* Phase 2B: Driving mode periodic stats at epoch end */
+        if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING && ctx->driving.active) {
+            /* Periodic breadcrumb with GPS position */
+            if (ctx->gps && ctx->gps->has_fix) {
+                /* Already logged per-AP breadcrumbs — this is a sweep-level GPS marker */
+            }
+            /* Periodic stats dump every 10 epochs (driving epochs are fast) */
+            if (ctx->epoch.epoch_num % 10 == 0) {
+                drv_dump_stats(&ctx->driving);
+            }
         }
 
         /* AUDIT FIX: Firmware health epoch tick + EAPOL cleanup */
