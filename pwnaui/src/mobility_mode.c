@@ -80,17 +80,26 @@ static const mobility_params_t MODE_PARAMS[MOBILITY_MODE_COUNT] = {
  *
  * AP churn is ONLY used when there is NO GPS fix AND no holdover.
  */
-static mobility_mode_t classify(float gps_speed, float mob_score, float ap_churn, int total_aps) {
+static mobility_mode_t classify(float gps_speed, float mob_score, float ap_churn, int total_aps, float accel) {
     /* GPS Doppler is available (>= 0) — trust it absolutely */
     if (gps_speed >= 0.0f) {
         if (gps_speed > MOB_SPEED_DRIVING) return MOBILITY_DRIVING;
         if (gps_speed > MOB_SPEED_WALKING) return MOBILITY_WALKING;
-        /* GPS says < 1.5 km/h = STATIONARY. Period.
-         * Do NOT let AP churn override — it's noise at home. */
+
+        /* GPS says < 1.5 km/h but accelerometer shows motion?
+         * This happens when Samsung Doppler reports 0 at walking speed.
+         * Trust the accelerometer as a tiebreaker. */
+        if (accel > MOB_ACCEL_DRIVING) return MOBILITY_DRIVING;
+        if (accel > MOB_ACCEL_WALKING) return MOBILITY_WALKING;
+
         return MOBILITY_STATIONARY;
     }
 
-    /* No GPS fix (speed < 0). AP churn is the only signal.
+    /* No GPS fix (speed < 0). Check accelerometer first, then AP churn. */
+    if (accel > MOB_ACCEL_DRIVING) return MOBILITY_DRIVING;
+    if (accel > MOB_ACCEL_WALKING) return MOBILITY_WALKING;
+
+    /* AP churn is the fallback signal.
      * Require minimum AP count to avoid noise from 2-3 APs. */
     if (total_aps >= MOB_MIN_APS_FOR_CHURN) {
         if (ap_churn > MOB_CHURN_DRIVING && mob_score > 0.5f) {
@@ -101,7 +110,7 @@ static mobility_mode_t classify(float gps_speed, float mob_score, float ap_churn
         }
     }
 
-    /* No GPS, insufficient APs for churn — assume stationary */
+    /* No GPS, no accel, insufficient APs for churn — assume stationary */
     return MOBILITY_STATIONARY;
 }
 
@@ -136,7 +145,9 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
                           float gps_speed,
                           float mob_score,
                           float ap_churn,
-                          int total_aps) {
+                          int total_aps,
+                          float accel,
+                          int steps) {
     if (!ctx || !ctx->initialized) return false;
 
     time_t now = time(NULL);
@@ -146,6 +157,9 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
     ctx->mobility_score = mob_score;
     ctx->ap_churn_rate = ap_churn;
     ctx->total_aps = total_aps;
+    ctx->accel_magnitude = accel;
+    ctx->prev_step_count = ctx->step_count;
+    ctx->step_count = steps;
     ctx->last_check = now;
 
     /* GPS speed sanity clamp: reject absurd readings as noise */
@@ -158,9 +172,13 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
     /* Asymmetric EMA speed smoothing + GPS holdover:
      * - Upward (accelerating): use MOB_SPEED_SMOOTH_ALPHA (0.9) — fast but dampens spikes
      * - Downward (decelerating): snap immediately to raw speed.
-     * - GPS dropout (raw=-1.0): use last smoothed speed for up to 30s,
+     * - Zero-speed suspicious: when smoothed was above walking pace but raw is
+     *   exactly 0.0, use MOB_SPEED_ZERO_ALPHA (0.3) — Samsung Doppler reports 0 at
+     *   walking/low driving speeds even when moving.  Full EMA would kill mode
+     *   in 1 reading (0.9*0=0). Slow alpha decays over ~3-5 readings instead.
+     * - GPS dropout (raw=-1.0): use last smoothed speed for up to 120s,
      *   decaying 15% per reading to gradually return to stationary.
-     *   BT GPS drops for 10-16s regularly; without holdover, every dropout
+     *   BT GPS drops for 10-100s regularly; without holdover, every dropout
      *   causes WLK->STA->WLK oscillation. */
     float smoothed = gps_speed;
     if (gps_speed >= 0.0f) {
@@ -168,6 +186,12 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
         if (ctx->smoothed_speed < 0.0f) {
             /* First valid GPS reading — seed EMA */
             ctx->smoothed_speed = gps_speed;
+        } else if (gps_speed < 0.01f && ctx->smoothed_speed > MOB_SPEED_WALKING) {
+            /* Suspicious zero: speed was above walking pace but raw jumped to 0.
+             * Samsung Doppler often reports 0 at walking/low driving speeds.
+             * Use slow alpha so mode survives 3-5 spurious zeros. */
+            ctx->smoothed_speed = MOB_SPEED_ZERO_ALPHA * gps_speed
+                                + (1.0f - MOB_SPEED_ZERO_ALPHA) * ctx->smoothed_speed;
         } else if (gps_speed < ctx->smoothed_speed * 0.5f) {
             /* Speed dropped by >50% — user stopped or braked hard.
              * Snap to raw immediately, don't ghost. */
@@ -192,7 +216,7 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
     }
 
     /* Use smoothed speed for classification, not raw */
-    mobility_mode_t detected = classify(smoothed, mob_score, ap_churn, total_aps);
+    mobility_mode_t detected = classify(smoothed, mob_score, ap_churn, total_aps, accel);
 
     /* Debug log every update for field diagnosis */
     {
@@ -206,8 +230,10 @@ bool mobility_mode_update(mobility_ctx_t *ctx,
                 strftime(ts, sizeof(ts), "%H:%M:%S", tm);
                 static const char *mode_names[] = {"STA","WLK","DRV"};
                 fprintf(f, "[%s] raw=%.1f smooth=%.1f mob=%.2f churn=%.2f aps=%d "
+                        "accel=%.2f steps=%d "
                         "cur=%s det=%s pend=%s cnt=%d\n",
                         ts, gps_speed, ctx->smoothed_speed >= 0 ? ctx->smoothed_speed : -1.0f, mob_score, ap_churn, total_aps,
+                        accel, steps,
                         mode_names[ctx->current_mode],
                         mode_names[detected],
                         mode_names[ctx->pending_mode],

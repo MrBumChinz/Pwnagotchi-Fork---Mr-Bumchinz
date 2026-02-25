@@ -41,8 +41,9 @@
  * At 0.9, speed tracks GPS within 1 reading.
  * Doppler speed is already filtered by the receiver chip. */
 #define MOB_SPEED_SMOOTH_ALPHA  0.9f   /* Near-instant tracking: 1 reading to converge */
+#define MOB_SPEED_ZERO_ALPHA    0.3f   /* Slow decay when speed jumps to 0 from above walking pace */
 #define MOB_SPEED_MAX_SANE      120.0f  /* Reject GPS > 120 km/h as noise */
-#define MOB_GPS_HOLDOVER_S      30      /* Use last GPS speed for up to 30s after dropout */
+#define MOB_GPS_HOLDOVER_S      120     /* Use last GPS speed for up to 120s after BT dropout */
 #define MOB_SWITCH_COOLDOWN_S   5       /* Min 5s between mode switches (was 8) */
 
 /* AP churn thresholds (fraction of total APs changed per check) */
@@ -50,6 +51,10 @@
 #define MOB_CHURN_WALKING        0.25   /* 25-60% = walking (raised from 0.15 — too sensitive at low AP count) */
                                         /* < 25% = stationary */
 #define MOB_MIN_APS_FOR_CHURN    5      /* Need >= 5 APs for churn to be meaningful */
+
+/* Accelerometer thresholds for motion detection (m/s² RMS) */
+#define MOB_ACCEL_WALKING       0.4f    /* > 0.4 m/s² = walking motion */
+#define MOB_ACCEL_DRIVING       1.5f    /* > 1.5 m/s² = vehicle vibration */
 
 /* Mode-specific parameters */
 
@@ -116,6 +121,9 @@ typedef struct {
     /* Input snapshot (updated each check) */
     float gps_speed_kmh;                /* Latest GPS speed */
     float smoothed_speed;               /* EMA-smoothed GPS speed */
+    float accel_magnitude;              /* Phone accelerometer RMS (m/s²), 0=still */
+    int   step_count;                   /* Phone step counter (cumulative) */
+    int   prev_step_count;              /* Previous step count for delta */
     float mobility_score;               /* Latest brain mobility_score */
     float ap_churn_rate;                /* AP churn fraction (0.0-1.0) */
     int   total_aps;                    /* Total APs visible */
@@ -159,13 +167,17 @@ int mobility_mode_init(mobility_ctx_t *ctx);
  * @param mob_score     Current brain mobility_score (0.0-1.0)
  * @param ap_churn      AP churn fraction (0.0-1.0)
  * @param total_aps     Total visible APs
+ * @param accel         Phone accelerometer RMS magnitude (m/s²), 0 if unavailable
+ * @param steps         Phone step counter (cumulative since app start)
  * @return true if mode changed (caller should apply new params)
  */
 bool mobility_mode_update(mobility_ctx_t *ctx,
                           float gps_speed,
                           float mob_score,
                           float ap_churn,
-                          int total_aps);
+                          int total_aps,
+                          float accel,
+                          int steps);
 
 /**
  * Get current mobility mode.

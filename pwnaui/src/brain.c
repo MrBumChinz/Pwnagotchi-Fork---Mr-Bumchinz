@@ -162,15 +162,37 @@ static void update_mobility(brain_ctx_t *ctx) {
     }
 
     /* Phase 1C: Feed data to mobility mode detector for DRV/WLK/STA switching.
-     * GPS speed_kmh is the primary signal; mobility_score + ap_churn are fallbacks. */
+     * GPS speed_kmh is the primary signal; mobility_score + ap_churn are fallbacks.
+     * Accelerometer from phone is a tiebreaker when GPS Doppler reports 0. */
     float gps_speed_kmh = -1.0f;  /* -1 = no GPS; classify() uses >= 0 as "GPS present" */
     if (ctx->gps && ctx->gps->has_fix) {
         gps_speed_kmh = (float)ctx->gps->speed_kmh;
     }
+
+    /* Read accelerometer + step count from /tmp/gps.json (written by bt_gps_receiver).
+     * These come from Android's SensorManager, not NMEA, so they're in the JSON sideband. */
+    float phone_accel = 0.0f;
+    int phone_steps = 0;
+    {
+        FILE *gf = fopen("/tmp/gps.json", "r");
+        if (gf) {
+            char buf[512];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, gf);
+            buf[n] = '\0';
+            fclose(gf);
+            /* Quick parse: find "Accel": and "Steps": */
+            const char *ap = strstr(buf, "\"Accel\":");
+            if (ap) phone_accel = (float)atof(ap + 8);
+            const char *sp = strstr(buf, "\"Steps\":");
+            if (sp) phone_steps = atoi(sp + 8);
+        }
+    }
+
     /* Use smoothed AP churn, not raw per-epoch delta.
      * Raw churn oscillates too wildly for hysteresis to work. */
     if (mobility_mode_update(&ctx->mobility_ctx, gps_speed_kmh,
-                             ctx->mobility_score, smoothed_churn, ctx->total_aps)) {
+                             ctx->mobility_score, smoothed_churn, ctx->total_aps,
+                             phone_accel, phone_steps)) {
         /* Mode changed — apply new parameters to brain config */
         const mobility_params_t *p = mobility_mode_get_params(&ctx->mobility_ctx);
         ctx->config.recon_time = p->recon_time;
@@ -232,9 +254,10 @@ static void update_mobility(brain_ctx_t *ctx) {
     }
 
     /* Debug: always log mobility inputs AFTER update (so smoothed_speed is current) */
-    fprintf(stderr, "[brain] [mobility-dbg] raw=%.1f smooth=%.1fkm/h score=%.2f churn=%.2f(s=%.2f delta=%d/aps=%d) mode=%s\n",
+    fprintf(stderr, "[brain] [mobility-dbg] raw=%.1f smooth=%.1fkm/h accel=%.2f steps=%d score=%.2f churn=%.2f(s=%.2f delta=%d/aps=%d) mode=%s\n",
             gps_speed_kmh,
             ctx->mobility_ctx.smoothed_speed,
+            phone_accel, phone_steps,
             ctx->mobility_score, 
             smoothed_churn,
             (ctx->total_aps > 0) ? (float)ap_delta / (float)ctx->total_aps : 0.0f,
