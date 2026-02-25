@@ -202,6 +202,12 @@ static void update_mobility(brain_ctx_t *ctx) {
         ctx->config.throttle_a = p->throttle_a;
         ctx->config.throttle_d = p->throttle_d;
 
+        /* Wire deauth/associate enables to actual config gates.
+         * Without this, config.deauth and config.associate stay true forever
+         * (hardcoded defaults) even when driving mode sets them false. */
+        ctx->config.deauth = p->deauth_enabled;
+        ctx->config.associate = p->associate_enabled;
+
         /* Gate attack phases based on mobility mode */
         if (p->pmkid_only) {
             /* DRIVING: only PMKID (phase 0) and Passive (phase 7) */
