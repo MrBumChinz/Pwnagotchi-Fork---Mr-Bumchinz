@@ -2,7 +2,7 @@
 # Build the high-performance C UI daemon for Pwnagotchi
 
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE -MMD -MP
+CFLAGS = -Wall -Wextra -O2 -std=gnu11 -fno-builtin -D_GNU_SOURCE -MMD -MP
 LDFLAGS = -lm -lutil -lpthread -lsqlite3
 
 # Optional: libwebsockets for bettercap WebSocket client
@@ -61,7 +61,8 @@ SOURCES = $(SRCDIR)/pwnaui.c \
 	$(SRCDIR)/driving_mode.c \
 	$(SRCDIR)/stationary_mode.c \
 	$(SRCDIR)/walking_mode.c \
-        $(SRCDIR)/model_inference.c
+        $(SRCDIR)/model_inference.c \
+	$(SRCDIR)/compat_isoc23.c
 # Test sources (modules without main())
 TEST_MODULES = $(SRCDIR)/ipc.c \
                $(SRCDIR)/renderer.c \
