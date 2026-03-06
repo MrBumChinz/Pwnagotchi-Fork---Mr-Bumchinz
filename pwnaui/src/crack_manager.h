@@ -5,8 +5,14 @@
  * (no APs visible), we run aircrack-ng at lowest CPU priority against
  * captured handshakes using available wordlists.
  *
+ * 3-list architecture (Pi side — raw passwords only, NO rulesets):
+ *   1. learned.txt   — Successfully cracked passwords from fleet (synced via GitHub)
+ *   2. community.txt — User-contributed whitelist passwords from fleet (synced via GitHub)
+ *   3. default.txt   — Static top 5K common WiFi passwords (ships with device, user-modifiable)
+ *
  * Cracking is killed instantly when the brain needs CPU for attacks.
  * Results are saved to /home/pi/cracked/ and logged to journalctl.
+ * Cracked passwords are added (raw, no variants) to learned.txt and synced to fleet.
  */
 
 #ifndef CRACK_MANAGER_H
@@ -18,7 +24,7 @@
 
 #define CRACK_MAX_PATH      256
 #define CRACK_MAX_TARGETS   64
-#define CRACK_MAX_WORDLISTS 8
+#define CRACK_MAX_WORDLISTS 3   /* learned, community, default */
 
 #define CRACK_HANDSHAKES_DIR "/home/pi/handshakes"
 #define CRACK_OUTPUT_DIR     "/home/pi/cracked"

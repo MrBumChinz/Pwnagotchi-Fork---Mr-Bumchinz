@@ -38,11 +38,17 @@ static struct {
 static int _pos_ring_idx = 0;
 static int _pos_ring_count = 0;
 
-/* Speed source tracking: VTG/RMC Doppler speed is authoritative for low speeds
- * (walking). Haversine position-differencing is only a fallback because consumer
- * GPS positions don't update fast enough to detect walking (~5m CEP). */
+/* Speed source: VTG/RMC Doppler ONLY.
+ * Haversine position-differencing is computed for DIAGNOSTIC LOGGING but
+ * NEVER sets speed_kmh.  With 22m GPS accuracy, position jitter produces
+ * 10-35 km/h phantom speed, causing false DRV mode switches (18.7% of
+ * readings in field testing).  The root cause is _last_vtg_speed_ms=0
+ * at startup and after BT timeout, making vtg_stale=true so haversine
+ * fires during GPS warm-up and BT reconnect — exactly when positions
+ * are least stable.  Doppler is accurate above ~2 km/h and correctly
+ * reports 0 below that; walking detection uses accel/steps instead. */
 static uint64_t _last_vtg_speed_ms = 0;  /* Timestamp of last VTG/RMC speed update */
-#define GPS_VTG_STALE_MS  10000           /* Use haversine if no VTG in 10 seconds */
+#define GPS_VTG_STALE_MS  10000           /* Diagnostic: flag when no VTG in 10s */
 
 /* NMEA sentence counters for diagnostics */
 static uint32_t _nmea_gga_count = 0;
@@ -301,12 +307,14 @@ static double nmea_parse_coord(const char *coord, const char *dir) {
 }
 
 /*
- * Parse NMEA GPGGA sentence
- * $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47
+ * Parse NMEA GGA sentence
+ * Accepts any talker: $GPGGA, $GNGGA, $GLGGA, $GAGGA
+ * $xxGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47
  */
 int nmea_parse_gpgga(const char *sentence, gps_data_t *data) {
     if (!sentence || !data) return 0;
-    if (strncmp(sentence, "$GPGGA", 6) != 0) return 0;
+    /* Accept any GNSS talker ID */
+    if (sentence[0] != '$' || strncmp(sentence + 3, "GGA", 3) != 0) return 0;
     
     /* Validate checksum */
     if (!nmea_validate_checksum(sentence)) {
@@ -323,8 +331,8 @@ int nmea_parse_gpgga(const char *sentence, gps_data_t *data) {
     double altitude = 0.0;
     char alt_unit[4] = {0};
     
-    /* $GPGGA,time,lat,N,lon,E,quality,sats,hdop,alt,M,geoid,M,dgps_age,dgps_id*checksum */
-    int parsed = sscanf(sentence, "$GPGGA,%15[^,],%15[^,],%3[^,],%15[^,],%3[^,],%d,%d,%lf,%lf,%3[^,]",
+    /* Skip $xxGGA, prefix (7 chars) to parse fields regardless of talker ID */
+    int parsed = sscanf(sentence + 7, "%15[^,],%15[^,],%3[^,],%15[^,],%3[^,],%d,%d,%lf,%lf,%3[^,]",
                         time_str, lat_str, lat_dir, lon_str, lon_dir,
                         &fix_quality, &satellites, &hdop, &altitude, alt_unit);
     
@@ -349,49 +357,66 @@ int nmea_parse_gpgga(const char *sentence, gps_data_t *data) {
 }
 
 /*
- * Parse NMEA GPVTG sentence (velocity/track)
- * $GPVTG,054.7,T,034.4,M,005.5,N,010.2,K*48
+ * Parse NMEA VTG sentence (velocity/track)
+ * Accepts any talker: $GPVTG, $GNVTG, $GLVTG, $GAVTG
+ * $xxVTG,054.7,T,034.4,M,005.5,N,010.2,K[,mode]*cs
+ * Empty course fields are valid (no heading when stationary)
  */
 int nmea_parse_gpvtg(const char *sentence, gps_data_t *data) {
     if (!sentence || !data) return 0;
-    if (strncmp(sentence, "$GPVTG", 6) != 0) return 0;
+    /* Accept any GNSS talker ID: check $, then sentence type at offset 3 */
+    if (sentence[0] != '$' || strncmp(sentence + 3, "VTG", 3) != 0) return 0;
     
     if (!nmea_validate_checksum(sentence)) {
         return 0;
     }
     
-    double bearing = 0.0;
-    double speed_knots = 0.0;
-    double speed_kmh = 0.0;
-    char t_indicator[4], m_indicator[4], n_indicator[4], k_indicator[4];
-    double bearing_mag = 0.0;
+    /* Parse by splitting on commas — sscanf can't handle empty NMEA fields.
+     * Fields: 0=cogt, 1=T, 2=cogm, 3=M, 4=sokn, 5=N, 6=sokm, 7=K[, 8=mode] */
+    const char *p = strchr(sentence, ',');
+    if (!p) return 0;
+    p++;  /* skip first comma after sentence type */
     
-    int parsed = sscanf(sentence, "$GPVTG,%lf,%3[^,],%lf,%3[^,],%lf,%3[^,],%lf,%3[^,]",
-                        &bearing, t_indicator, &bearing_mag, m_indicator,
-                        &speed_knots, n_indicator, &speed_kmh, k_indicator);
+    char fields[10][32];
+    memset(fields, 0, sizeof(fields));
+    int nfields = 0;
     
-    if (parsed >= 7) {
-        data->bearing = bearing;
-        /* VTG Doppler speed is authoritative — it detects walking speed
-         * accurately via carrier frequency shift, unlike haversine which
-         * can't resolve ~7m walking distance vs ~5m GPS CEP jitter. */
-        data->speed_knots = speed_knots;
-        data->speed_kmh = speed_kmh;
-        _last_vtg_speed_ms = data->last_nmea_ms;
-        _nmea_vtg_count++;
-        return 1;
+    while (nfields < 10 && *p && *p != '*') {
+        int i = 0;
+        while (*p && *p != ',' && *p != '*' && i < 31) {
+            fields[nfields][i++] = *p++;
+        }
+        fields[nfields][i] = '\0';
+        nfields++;
+        if (*p == ',') p++;
     }
     
-    return 0;
+    if (nfields < 8) return 0;
+    
+    double bearing = (fields[0][0]) ? atof(fields[0]) : 0.0;
+    double speed_knots = (fields[4][0]) ? atof(fields[4]) : 0.0;
+    double speed_kmh = (fields[6][0]) ? atof(fields[6]) : 0.0;
+    
+    data->bearing = bearing;
+    /* VTG Doppler speed is authoritative — it detects walking speed
+     * accurately via carrier frequency shift, unlike haversine which
+     * can't resolve ~7m walking distance vs ~5m GPS CEP jitter. */
+    data->speed_knots = speed_knots;
+    data->speed_kmh = speed_kmh;
+    _last_vtg_speed_ms = data->last_nmea_ms;
+    _nmea_vtg_count++;
+    return 1;
 }
 
 /*
- * Parse NMEA GPRMC sentence (recommended minimum)
- * $GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A
+ * Parse NMEA RMC sentence (recommended minimum)
+ * Accepts any talker: $GPRMC, $GNRMC, $GLRMC, $GARMC
+ * $xxRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A
  */
 int nmea_parse_gprmc(const char *sentence, gps_data_t *data) {
     if (!sentence || !data) return 0;
-    if (strncmp(sentence, "$GPRMC", 6) != 0) return 0;
+    /* Accept any GNSS talker ID */
+    if (sentence[0] != '$' || strncmp(sentence + 3, "RMC", 3) != 0) return 0;
     
     if (!nmea_validate_checksum(sentence)) {
         return 0;
@@ -404,7 +429,8 @@ int nmea_parse_gprmc(const char *sentence, gps_data_t *data) {
     double speed_knots = 0.0;
     double bearing = 0.0;
     
-    int parsed = sscanf(sentence, "$GPRMC,%15[^,],%c,%15[^,],%3[^,],%15[^,],%3[^,],%lf,%lf",
+    /* Skip $xxRMC, prefix (7 chars) to parse fields regardless of talker ID */
+    int parsed = sscanf(sentence + 7, "%15[^,],%c,%15[^,],%3[^,],%15[^,],%3[^,],%lf,%lf",
                         time_str, &status, lat_str, lat_dir, lon_str, lon_dir,
                         &speed_knots, &bearing);
     
@@ -469,16 +495,26 @@ int plugin_gps_handle_data(gps_data_t *data) {
         }
     }
     
-    /* Parse NMEA for display */
+    /* Parse NMEA for display — accept any GNSS talker ($GP, $GN, $GL, $GA) */
     int parsed = 0;
-    if (strncmp(buffer, "$GPGGA", 6) == 0) {
+    if (buffer[0] == '$' && strncmp(buffer + 3, "GGA", 3) == 0) {
         parsed = nmea_parse_gpgga(buffer, data);
         _nmea_gga_count++;
 
-        /* Haversine speed from position differencing — FALLBACK ONLY.
-         * Only used when no VTG/RMC Doppler speed has arrived recently.
-         * Consumer GPS positions have ~5m CEP which cannot reliably
-         * resolve walking distance (~7m in 5s) from jitter. */
+        /* Haversine speed from position differencing — DIAGNOSTIC ONLY.
+         * With 22m GPS accuracy, position jitter produces 10-30m of apparent
+         * distance over 5s, translating to 7-35 km/h phantom speed.
+         * This is fundamentally unreliable for speed estimation because:
+         *   - Walking (7m/5s) is indistinguishable from GPS jitter (10-30m/5s)
+         *   - _last_vtg_speed_ms initializes to 0 → vtg_stale=true at startup
+         *   - GPS timeout resets _last_vtg_speed_ms → vtg_stale=true on reconnect
+         *   - Even brief BT gaps produce vtg_stale=true with stale ring buffer
+         * Result: 18.7% false speed readings, causing false DRV mode switches.
+         *
+         * Haversine is computed and LOGGED but NEVER sets speed_kmh.
+         * Speed comes exclusively from VTG/RMC Doppler (accurate above ~2 km/h).
+         * When Doppler is unavailable, speed stays at its last known value (0).
+         * Brain.c falls back to JSON Android speed if NMEA has no fix entirely. */
         if (parsed && data->has_fix && data->latitude != 0.0) {
             uint64_t now_ms = data->last_nmea_ms;
 
@@ -489,9 +525,10 @@ int plugin_gps_handle_data(gps_data_t *data) {
             _pos_ring_idx = (_pos_ring_idx + 1) % GPS_POS_WINDOW;
             if (_pos_ring_count < GPS_POS_WINDOW) _pos_ring_count++;
 
-            /* Only compute haversine speed if no VTG/RMC in last 10s */
+            /* Compute haversine speed for diagnostic logging only */
             bool vtg_stale = (now_ms - _last_vtg_speed_ms) > GPS_VTG_STALE_MS;
-            if (vtg_stale && _pos_ring_count >= 2) {
+            double hav_speed_kmh = -1.0;
+            if (_pos_ring_count >= 2) {
                 int oldest_idx = (_pos_ring_count < GPS_POS_WINDOW)
                     ? 0
                     : _pos_ring_idx;
@@ -507,25 +544,30 @@ int plugin_gps_handle_data(gps_data_t *data) {
                         _pos_ring[newest_idx].lat, _pos_ring[newest_idx].lon
                     );
                     if (dist_m < 3.0 && dt_s < 3.0) {
-                        data->speed_kmh = 0.0;
+                        hav_speed_kmh = 0.0;
                     } else {
-                        data->speed_kmh = (dist_m / dt_s) * 3.6;
+                        hav_speed_kmh = (dist_m / dt_s) * 3.6;
+                        if (hav_speed_kmh > 200.0) hav_speed_kmh = 0.0;
                     }
-                    data->speed_knots = data->speed_kmh / 1.852;
                 }
             }
 
+            /* DO NOT set speed_kmh from haversine — Doppler-only is authoritative.
+             * Haversine was the root cause of false DRV: 22m GPS accuracy produces
+             * 10-35 km/h phantom speed from position jitter, especially after
+             * BT reconnect when _last_vtg_speed_ms resets to 0 (vtg_stale=true). */
+
             /* Periodic NMEA source diagnostic (every 60 GGA sentences ~1min) */
             if ((_nmea_gga_count % 60) == 0) {
-                fprintf(stderr, "[gps] NMEA stats: GGA=%u VTG=%u RMC=%u speed=%.1fkm/h src=%s\n",
+                fprintf(stderr, "[gps] NMEA stats: GGA=%u VTG=%u RMC=%u speed=%.1fkm/h hav=%.1fkm/h src=%s\n",
                         _nmea_gga_count, _nmea_vtg_count, _nmea_rmc_count,
-                        data->speed_kmh,
-                        vtg_stale ? "haversine" : "doppler");
+                        data->speed_kmh, hav_speed_kmh,
+                        vtg_stale ? "vtg_stale(ignored)" : "doppler");
             }
         }
-    } else if (strncmp(buffer, "$GPVTG", 6) == 0) {
+    } else if (buffer[0] == '$' && strncmp(buffer + 3, "VTG", 3) == 0) {
         parsed = nmea_parse_gpvtg(buffer, data);
-    } else if (strncmp(buffer, "$GPRMC", 6) == 0) {
+    } else if (buffer[0] == '$' && strncmp(buffer + 3, "RMC", 3) == 0) {
         parsed = nmea_parse_gprmc(buffer, data);
     }
     

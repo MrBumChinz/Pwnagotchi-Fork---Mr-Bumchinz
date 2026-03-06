@@ -453,24 +453,24 @@ static void epd_init_base_image_v4(const uint8_t *image) {
     int epd_width = 122;
     int epd_height = 250;
     int epd_row_bytes = (epd_width + 7) / 8;
-    
+
     static uint8_t transposed[16 * 250];
     transpose_framebuffer_for_epd(image, transposed, 250, 122);
-    
+
     /* Write to RAM Black (0x24) */
     epd_send_command(0x24);
     epd_send_data_burst(transposed, epd_row_bytes * epd_height);
-    
+
     /* Write to RAM Red/Old (0x26) - this is the "base" for partial */
     epd_send_command(0x26);
     epd_send_data_burst(transposed, epd_row_bytes * epd_height);
-    
+
     /* Full refresh to establish base */
     epd_send_command(0x22);
     epd_send_data(0xF7);
     epd_send_command(0x20);
     epd_wait_busy();
-    
+
     g_v4_base_initialized = 1;
 }
 
@@ -478,17 +478,17 @@ static void epd_display_2in13_v4(const uint8_t *image, int partial) {
     int epd_width = 122;
     int epd_height = 250;
     int epd_row_bytes = (epd_width + 7) / 8;  /* 16 bytes per row */
-    
+
     /* If base not initialized, do full refresh first */
     if (!g_v4_base_initialized) {
         epd_init_base_image_v4(image);
         return;
     }
-    
+
     /* Transpose from our 250×122 framebuffer to e-ink's 122×250 format */
     static uint8_t transposed[16 * 250];  /* 4000 bytes */
     transpose_framebuffer_for_epd(image, transposed, 250, 122);
-    
+
     if (partial) {
         /* V4 Partial refresh - exact sequence from Waveshare Python driver */
         /* Reset pulse - must match Python driver timing */
@@ -498,21 +498,21 @@ static void epd_display_2in13_v4(const uint8_t *image, int partial) {
         usleep(2000);
         gpio_write(EPD_RST_PIN, 1);
         usleep(20000);
-        
+
         /* CRITICAL: Wait for controller to be ready after reset */
         epd_wait_busy();
-        
+
         epd_send_command(0x3C);  /* Border waveform */
         epd_send_data(0x80);
-        
+
         epd_send_command(0x01);  /* Driver output control */
         epd_send_data(0xF9);
         epd_send_data(0x00);
         epd_send_data(0x00);
-        
+
         epd_send_command(0x11);  /* Data entry mode */
         epd_send_data(0x03);
-        
+
         /* Set window */
         epd_send_command(0x44);
         epd_send_data(0x00);
@@ -522,18 +522,18 @@ static void epd_display_2in13_v4(const uint8_t *image, int partial) {
         epd_send_data(0x00);
         epd_send_data((epd_height - 1) & 0xFF);
         epd_send_data((epd_height - 1) >> 8);
-        
+
         /* Set cursor */
         epd_send_command(0x4E);
         epd_send_data(0x00);
         epd_send_command(0x4F);
         epd_send_data(0x00);
         epd_send_data(0x00);
-        
+
         /* Write ONLY to RAM Black (0x24), not to 0x26 */
         epd_send_command(0x24);
         epd_send_data_burst(transposed, epd_row_bytes * epd_height);
-        
+
         /* Partial update - NO BLINK */
         epd_send_command(0x22);
         epd_send_data(0xFF);  /* Partial mode */
@@ -546,13 +546,13 @@ static void epd_display_2in13_v4(const uint8_t *image, int partial) {
         epd_send_command(0x4F);
         epd_send_data(0x00);
         epd_send_data(0x00);
-        
+
         /* Write to both RAM buffers */
         epd_send_command(0x24);
         epd_send_data_burst(transposed, epd_row_bytes * epd_height);
         epd_send_command(0x26);
         epd_send_data_burst(transposed, epd_row_bytes * epd_height);
-        
+
         epd_send_command(0x22);
         epd_send_data(0xF7);  /* Full refresh */
         epd_send_command(0x20);

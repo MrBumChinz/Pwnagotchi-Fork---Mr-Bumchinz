@@ -5,10 +5,14 @@
  * Replaces Python/PIL UI with native C for 10-30?? performance improvement.
  * 
  * Author: PwnaUI Project
- * License: MIT
+ * License: GPL-3.0-or-later
  */
 
+#define PWNAUI_VERSION "3.0.0"
+
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +24,7 @@
 #include <sys/un.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <dirent.h>
 #include "pcap_check.h"
 #include <syslog.h>
@@ -71,10 +76,10 @@ static uint8_t g_display_fb[DISPLAY_MAX_WIDTH * DISPLAY_MAX_HEIGHT / 8];  /* Cop
 
 /* Native C plugins state */
 static plugin_state_t g_plugins;
-static uint64_t g_last_full_refresh_ms = 0;
+static uint64_t g_last_full_refresh_ms __attribute__((unused)) = 0;
 
-/* GPS CNCplugin enabled flag (separate from native_plugins for future flexibility) */
-static int g_gps_enabled = 0;
+/* GPS plugin enabled flag (separate from native_plugins for future flexibility) */
+static int g_gps_enabled __attribute__((unused)) = 0;
 
 /* Bettercap WebSocket client state */
 static int g_bcap_enabled = 0;
@@ -139,6 +144,7 @@ static time_t g_last_stats_scan = 0;
 
 
 /* Convert brain mood enum to string */
+static const char *brain_mood_str(brain_mood_t mood) __attribute__((unused));
 static const char *brain_mood_str(brain_mood_t mood) {
     /* Must match brain_mood_t enum order exactly */
     if (mood >= 0 && mood < MOOD_NUM_MOODS) return brain_mood_names[mood];
@@ -386,13 +392,13 @@ static const char **VOICE_MESSAGES[] = {
     VOICE_SYNCING_MSG,
 };
 
-/* Action-specific voices */
-static const char *VOICE_DEAUTH[] = {
+/* Action-specific voices (used by get_attack_voice) */
+static const char *VOICE_DEAUTH[] __attribute__((unused)) = {
     "Booted that client right off~ No Wi-Fi for you!",
     NULL
 };
 
-static const char *VOICE_ASSOC[] = {
+static const char *VOICE_ASSOC[] __attribute__((unused)) = {
     "Snatching that juicy PMKID... mmm, tasty hash incoming~",
     NULL
 };
@@ -699,7 +705,6 @@ static void update_uptime_display(void) {
     pthread_mutex_unlock(&g_ui_mutex);
 }
 
-/* ==========================================================================
 /* ==========================================================================
  * Brain UI Callbacks - update display when brain changes state
  * ========================================================================== */
@@ -1138,11 +1143,9 @@ static void bcap_on_event(const bcap_event_t *event, void *user_data) {
             /* INSTANT-ATTACK: immediately associate with new AP for PMKID grab.
              * Don't wait for next epoch -- fresh APs are most receptive.
              * Only fire on genuinely new APs that haven't been handshake'd yet.
-             * Uses LOCAL pcap cache (not bettercap's session-only flag).
-             * Also checks stealth whitelist to never attack home/office networks. */
+             * Uses LOCAL pcap cache (not bettercap's session-only flag). */
             if (is_genuinely_new && g_brain_ctx && g_bcap_ctx &&
-                !brain_has_full_handshake(mac_str) &&
-                !(g_brain_ctx->stealth && stealth_is_whitelisted(g_brain_ctx->stealth, event->data.ap.ssid))) {
+                !brain_has_full_handshake(mac_str)) {
                 char assoc_cmd[128];
                 snprintf(assoc_cmd, sizeof(assoc_cmd), "wifi.assoc %s", mac_str);
                 bcap_send_command(g_bcap_ctx, assoc_cmd);
@@ -1208,9 +1211,7 @@ static void bcap_on_event(const bcap_event_t *event, void *user_data) {
                 /* Check if we already have the handshake for this AP (local pcap cache) */
                 bcap_ap_t client_ap;
                 bool ap_found = (bcap_find_ap(g_bcap_ctx, &event->data.sta.ap_bssid, &client_ap) == 0);
-                bool ap_whitelisted = ap_found && g_brain_ctx->stealth &&
-                    stealth_is_whitelisted(g_brain_ctx->stealth, client_ap.ssid);
-                if (ap_found && !brain_has_full_handshake(ap_mac) && !ap_whitelisted) {
+                if (ap_found && !brain_has_full_handshake(ap_mac)) {
                     char deauth_cmd[128];
                     snprintf(deauth_cmd, sizeof(deauth_cmd), "wifi.deauth %s", sta_mac);
                     bcap_send_command(g_bcap_ctx, deauth_cmd);
@@ -1309,6 +1310,19 @@ static void webserver_gps_cb(double *lat, double *lon, int *has_fix) {
         *lon = 0.0;
         *has_fix = 0;
     }
+}
+
+/* Called by webserver when POST /api/config/name is received.
+ * Updates the display name in the UI state. */
+static void webserver_name_change_cb(const char *new_name) {
+    char display_name[64];
+    snprintf(display_name, sizeof(display_name), "%s>", new_name);
+    pthread_mutex_lock(&g_ui_mutex);
+    strncpy(g_ui_state.name, display_name, sizeof(g_ui_state.name) - 1);
+    g_ui_state.name[sizeof(g_ui_state.name) - 1] = '\0';
+    g_dirty = 1;
+    pthread_mutex_unlock(&g_ui_mutex);
+    fprintf(stderr, "[webserver] Name changed to: %s\n", new_name);
 }
 
 static void webserver_state_cb(char *buf, size_t bufsize) {
@@ -2044,13 +2058,13 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -s, --socket PATH  Socket path (default: %s)\n", SOCKET_PATH);
     fprintf(stderr, "  -D, --display TYPE Display type (waveshare2in13, fb, dummy)\n");
     fprintf(stderr, "  -h, --help       Show this help\n");
+    fprintf(stderr, "  -V, --version    Show version and exit\n");
 }
 
 /*
  * Main entry point
  */
 int main(int argc, char *argv[]) {
-    int opt;
     const char *socket_path = SOCKET_PATH;
     const char *display_type = "waveshare2in13_v4";  /* User display: Waveshare 2.13" V4 */
     int server_fd = -1;
@@ -2086,6 +2100,9 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return EXIT_SUCCESS;
+        } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
+            printf("pwnaui %s\n", PWNAUI_VERSION);
+            return EXIT_SUCCESS;
         }
     }
     
@@ -2095,6 +2112,14 @@ int main(int argc, char *argv[]) {
     }
     
     PWNAUI_LOG_INFO("PwnaUI starting...");
+    
+    /* Lower CPU priority so system services (SSH, etc.) stay responsive
+     * even if we're busy. Nice 10 = low priority, won't starve other procs */
+    if (nice(10) == -1 && errno != 0) {
+        PWNAUI_LOG_WARN("Failed to set nice value: %s", strerror(errno));
+    } else {
+        PWNAUI_LOG_INFO("Process priority lowered (nice=10)");
+    }
     
     /* Daemonize if requested */
     if (g_daemon_mode) {
@@ -2241,6 +2266,62 @@ int main(int argc, char *argv[]) {
     
     /* Initialize UI state */
     init_ui_state();
+    
+    /* Read pwnagotchi name from config.toml so display + hostname are correct */
+    {
+        char config_name[64] = {0};
+        const char *cfg_files[] = {"/etc/pwnagotchi/config.toml", "/etc/pwnagotchi/default.toml"};
+        for (int ci = 0; ci < 2 && config_name[0] == '\0'; ci++) {
+            FILE *cf = fopen(cfg_files[ci], "r");
+            if (!cf) continue;
+            char cline[512];
+            int in_main = 1;  /* Before any section = treat as [main] */
+            while (fgets(cline, sizeof(cline), cf)) {
+                /* Track current section */
+                if (cline[0] == '[') {
+                    in_main = (strstr(cline, "[main]") != NULL);
+                    continue;
+                }
+                /* Only match name = "..." in [main] section */
+                if (!in_main) continue;
+                /* Look for: name = "Sniffles" */
+                char *eq = strchr(cline, '=');
+                if (!eq) continue;
+                /* Extract key, trim whitespace */
+                char key[64] = {0};
+                size_t kl = eq - cline;
+                if (kl >= sizeof(key)) continue;
+                memcpy(key, cline, kl);
+                key[kl] = '\0';
+                char *k = key; while (*k == ' ' || *k == '\t') k++;
+                char *ke = k + strlen(k) - 1;
+                while (ke > k && (*ke == ' ' || *ke == '\t')) *ke-- = '\0';
+                if (strcmp(k, "name") != 0) continue;
+                /* Extract value between quotes */
+                char *q1 = strchr(eq + 1, '"');
+                if (!q1) continue;
+                char *q2 = strchr(q1 + 1, '"');
+                if (!q2) continue;
+                size_t nl = q2 - q1 - 1;
+                if (nl > 0 && nl < sizeof(config_name)) {
+                    memcpy(config_name, q1 + 1, nl);
+                    config_name[nl] = '\0';
+                }
+                break;
+            }
+            fclose(cf);
+        }
+        if (config_name[0]) {
+            /* Set display name (with > suffix like original pwnagotchi) */
+            char display_name[64];
+            snprintf(display_name, sizeof(display_name), "%s>", config_name);
+            pthread_mutex_lock(&g_ui_mutex);
+            strncpy(g_ui_state.name, display_name, sizeof(g_ui_state.name) - 1);
+            pthread_mutex_unlock(&g_ui_mutex);
+            PWNAUI_LOG_INFO("Loaded pwnagotchi name from config: %s", config_name);
+        }
+    }
+    
     g_start_time = time(NULL);  /* Initialize uptime counter */
     /* TCAPS computed live from pcap count */
     scan_handshake_stats();  /* Load initial stats from disk */
@@ -2321,6 +2402,7 @@ int main(int argc, char *argv[]) {
     }
         webserver_set_state_callback(webserver_state_cb);
         webserver_set_gps_callback(webserver_gps_cb);
+        webserver_set_name_callback(webserver_name_change_cb);
         attack_log_init();  /* Sprint 5: JSON attack log */
         g_webserver_fd = webserver_init(80);
         if (g_webserver_fd >= 0) {
@@ -2601,9 +2683,10 @@ int main(int argc, char *argv[]) {
         }
 
 
-        /* Timeout for periodic tasks - keep short to drain accept queue quickly */
+        /* Timeout for periodic tasks - 50ms is plenty for e-ink display
+         * Pi Zero W single-core: 20Hz loop = ~5% CPU vs 100Hz = ~25% CPU */
         timeout.tv_sec = 0;
-        timeout.tv_usec = 10000;  /* 10ms - fast response to prevent connection pileup */
+        timeout.tv_usec = 50000;  /* 50ms - balanced responsiveness vs CPU on Pi Zero */
         
         uint64_t _sect_before_select = get_time_ms();
         activity = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
@@ -2721,7 +2804,7 @@ int main(int argc, char *argv[]) {
                                  g_plugins.battery.percentage,
                                  g_plugins.battery.charging ? "+" : "");
                     } else {
-                        snprintf(g_ui_state.battery, sizeof(g_ui_state.battery), "");
+                        g_ui_state.battery[0] = '\0';
                     }
                     PWNAUI_LOG_INFO("Battery: %s", g_ui_state.battery);
                     g_dirty = 1;

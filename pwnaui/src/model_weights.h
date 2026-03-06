@@ -125,7 +125,7 @@ static const int8_t vuln_w3[16][1] = {
 #define PHASE_HIDDEN1 32
 #define PHASE_HIDDEN2 16
 #define PHASE_OUTPUT 8
-#define PHASE_AVAILABLE 1
+#define PHASE_AVAILABLE 0  /* Disabled: acc=0.125 (random=0.125), retrain needed */
 
 static const float phase_scale_b1 = 0.00008506f;
 static const float phase_scale_b2 = 0.00006941f;
@@ -220,7 +220,7 @@ static const int8_t phase_w3[16][8] = {
 #define CHAN_N_FEATURES 3
 #define CHAN_HIDDEN1 16
 #define CHAN_OUTPUT 14
-#define CHAN_AVAILABLE 1
+#define CHAN_AVAILABLE 0  /* Disabled: acc=0.000 (worse than random), retrain needed */
 
 static const float chan_scale_b1 = 0.00003382f;
 static const float chan_scale_b2 = 0.00008141f;
@@ -290,7 +290,7 @@ static const int dwell_ap_buckets[DWELL_N_BUCKETS] = {0, 1, 4, 9, 16, 30};
 #define PATTERN_HIDDEN1 16
 #define PATTERN_HIDDEN2 8
 #define PATTERN_OUTPUT 8
-#define PATTERN_AVAILABLE 1
+#define PATTERN_AVAILABLE 0  /* Disabled: acc=0.200 (random=0.125 but too low), retrain needed */
 
 static const float patt_scale_b1 = 0.00004885f;
 static const float patt_scale_b2 = 0.00013898f;

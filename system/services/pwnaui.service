@@ -2,18 +2,22 @@
 Description=PwnaUI - High-Performance UI Renderer for Pwnagotchi
 After=local-fs.target
 Before=pwnagotchi.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
+ExecStartPre=/usr/local/bin/pwnaui-hostname-sync
 ExecStart=/usr/local/bin/pwnaui -D waveshare2in13_v4 -p -B -w
 ExecStartPost=/usr/local/bin/pwnaui-set-theme
 Restart=on-failure
 RestartSec=5
+Nice=10
 NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=false
 PrivateTmp=false
-ReadWritePaths=/var/run /home/pi /tmp /var/lib/pwnagotchi
+ReadWritePaths=/var/run /home/pi /tmp /var/lib/pwnagotchi /etc/hostname /etc/hosts
 MemoryMax=32M
 CPUQuota=20%
 

@@ -5,6 +5,14 @@
  * On a Pi Zero W (~20 keys/sec WPA2), a 5500-word list takes ~5 minutes.
  * Designed for quick-win dictionary attacks, not brute force.
  *
+ * 3-list architecture (Pi side — raw passwords only, NO rulesets):
+ *   1. learned.txt   — Successfully cracked passwords from fleet (synced via GitHub)
+ *   2. community.txt — User-contributed whitelist passwords from fleet (synced via GitHub)
+ *   3. default.txt   — Static top 5K common WiFi passwords (ships with device, user-modifiable)
+ *
+ * Rulesets are PC Brain territory only (GPU can handle the expansion).
+ * Pi keeps lists raw and small for fast dictionary sweeps.
+ *
  * Process lifecycle:
  *   1. crack_mgr_start() — fork+exec aircrack-ng with nice -19
  *   2. crack_mgr_check() — waitpid(WNOHANG), check key file
@@ -85,18 +93,18 @@ static bool parse_bssid_from_filename(const char *filename,
 
 /*
  * Scan the wordlists directory.
- * Order: common.txt → combined_wifi.txt → rockyou.txt → anything else.
- * Smallest files tried first for quick wins.
+ * Priority order: learned.txt → community.txt → default.txt.
+ * These are the 3 Pi-side lists (raw passwords, no rulesets).
+ * Any extra .txt files in the directory are also picked up.
  */
 static void scan_wordlists(crack_mgr_t *mgr) {
     mgr->num_wordlists = 0;
 
-    /* Priority order (small → large) */
+    /* Priority order: learned (fleet cracked) → community (fleet whitelist) → default (static 5K) */
     const char *priority[] = {
         "learned.txt",
-        "common.txt",
-        "combined_wifi.txt",
-        "rockyou.txt",
+        "community.txt",
+        "default.txt",
         NULL
     };
 
@@ -482,77 +490,34 @@ void crack_mgr_stop(crack_mgr_t *mgr) {
 }
 
 
-/* Sprint 7 #19: Cracked password feedback - add to learned wordlist with variants */
+/* Add cracked password to learned.txt (raw, no variants).
+ * Variants/rulesets are PC Brain territory only — Pi keeps lists small. */
 static void crack_feedback_add_password(const char *password) {
-    if (!password || strlen(password) < 1) return;
+    if (!password || strlen(password) < 8) return;  /* WPA minimum */
 
     const char *learned_path = "/home/pi/wordlists/learned.txt";
-    char variants[32][128];
-    int nv = 0;
 
-    /* Original */
-    snprintf(variants[nv++], 128, "%s", password);
-
-    /* Capitalize first letter */
-    if (strlen(password) > 0 && islower((unsigned char)password[0])) {
-        snprintf(variants[nv], 128, "%s", password);
-        variants[nv][0] = toupper((unsigned char)variants[nv][0]);
-        nv++;
-    }
-
-    /* All uppercase */
-    snprintf(variants[nv], 128, "%s", password);
-    for (int i = 0; variants[nv][i]; i++)
-        variants[nv][i] = toupper((unsigned char)variants[nv][i]);
-    nv++;
-
-    /* All lowercase */
-    snprintf(variants[nv], 128, "%s", password);
-    for (int i = 0; variants[nv][i]; i++)
-        variants[nv][i] = tolower((unsigned char)variants[nv][i]);
-    nv++;
-
-    /* Append common suffixes */
-    const char *suffixes[] = {"1", "!", "123", "2024", "2025", "01", "69", "99", NULL};
-    for (int s = 0; suffixes[s] && nv < 30; s++) {
-        snprintf(variants[nv++], 128, "%s%s", password, suffixes[s]);
-    }
-
-    /* Read existing learned passwords */
-    char existing[512][128];
-    int nexist = 0;
+    /* Check if already in the file */
     FILE *f = fopen(learned_path, "r");
     if (f) {
         char line[128];
-        while (fgets(line, sizeof(line), f) && nexist < 512) {
+        while (fgets(line, sizeof(line), f)) {
             line[strcspn(line, "\n\r")] = 0;
-            if (strlen(line) > 0) {
-                snprintf(existing[nexist++], 128, "%s", line);
+            if (strcmp(line, password) == 0) {
+                fclose(f);
+                return;  /* Already present */
             }
         }
         fclose(f);
     }
 
-    /* Append new variants */
+    /* Append raw password (no variants) */
     f = fopen(learned_path, "a");
     if (!f) return;
-    int added = 0;
-    for (int v = 0; v < nv; v++) {
-        bool found = false;
-        for (int e = 0; e < nexist; e++) {
-            if (strcmp(existing[e], variants[v]) == 0) { found = true; break; }
-        }
-        if (!found) {
-            fprintf(f, "%s\n", variants[v]);
-            added++;
-        }
-    }
+    fprintf(f, "%s\n", password);
     fclose(f);
 
-    if (added > 0) {
-        fprintf(stderr, "[crack] Feedback: added %d variants of '%s' to learned.txt\n",
-                added, password);
-    }
+    fprintf(stderr, "[crack] Added '%s' to learned.txt (raw, no variants)\n", password);
 }
 
 

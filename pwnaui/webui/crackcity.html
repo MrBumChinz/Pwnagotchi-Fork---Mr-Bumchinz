@@ -26,8 +26,9 @@ hr{border:0;border-top:1px solid #333;margin:10px 0}
 .net{background:#0f3460;padding:8px;margin:5px 0;border-radius:4px;cursor:pointer;
  font-size:12px;transition:background 0.2s}
 .net:hover{background:#1a4a8a}
-.net.cracked{border-left:3px solid #0f0}
-.net.uncracked{border-left:3px solid #e94560}
+.net.cracked{border-left:3px solid #00ff00}
+.net.captured{border-left:3px solid #ffd700}
+.net.seen-only{border-left:3px solid #ff3333}
 .net .ssid{font-weight:bold;color:#fff;font-size:13px}
 .net .pwd{color:#0f0;margin:2px 0}
 .net .info{color:#888;font-size:10px}
@@ -38,6 +39,29 @@ hr{border:0;border-top:1px solid #333;margin:10px 0}
 .attack .time{color:#555;float:right}
 .pulse{animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+@keyframes gpsPulse{0%,100%{box-shadow:0 0 8px #00aaff,0 0 16px #00aaff}50%{box-shadow:0 0 16px #00aaff,0 0 32px #00aaff,0 0 48px rgba(0,170,255,0.3)}}
+/* Layer control styling */
+.leaflet-control-layers{background:#16213e!important;color:#ccc;border:1px solid #0f3460!important;border-radius:6px!important;font-family:'Courier New',monospace;font-size:12px}
+.leaflet-control-layers-expanded{padding:8px 12px 6px!important}
+.leaflet-control-layers label{color:#ccc;margin-bottom:3px;display:block;cursor:pointer}
+.leaflet-control-layers label:hover{color:#fff}
+.leaflet-control-layers-selector{margin-right:6px}
+.leaflet-control-layers-toggle{background-color:#0f3460;border-radius:4px}
+.map-style-label{font-size:10px;color:#e94560;font-weight:bold;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px}
+/* Follow-me button */
+#follow-btn{position:fixed;bottom:20px;right:20px;z-index:9999;width:48px;height:48px;
+ border-radius:50%;border:2px solid #0f3460;background:#16213e;color:#888;
+ font-size:22px;cursor:pointer;display:flex;align-items:center;justify-content:center;
+ box-shadow:0 2px 10px rgba(0,0,0,0.5);transition:all 0.3s}
+#follow-btn:hover{background:#0f3460;color:#ccc}
+#follow-btn.active{background:#00aaff;border-color:#00aaff;color:#fff;
+ box-shadow:0 0 12px #00aaff,0 0 24px rgba(0,170,255,0.4);animation:followPulse 2s infinite}
+@keyframes followPulse{0%,100%{box-shadow:0 0 12px #00aaff,0 0 24px rgba(0,170,255,0.4)}50%{box-shadow:0 0 18px #00aaff,0 0 36px rgba(0,170,255,0.6)}}
+#follow-btn .tooltip{position:absolute;bottom:56px;right:0;background:#16213e;color:#ccc;
+ padding:4px 10px;border-radius:4px;font-size:11px;font-family:'Courier New',monospace;
+ white-space:nowrap;opacity:0;pointer-events:none;transition:opacity 0.2s;
+ border:1px solid #0f3460}
+#follow-btn:hover .tooltip{opacity:1}
 @media(max-width:768px){
  #sidebar{position:relative;width:100%;height:auto;max-height:40vh}
  #map-container{position:relative;left:0;height:60vh}
@@ -57,6 +81,10 @@ hr{border:0;border-top:1px solid #333;margin:10px 0}
  <div id="panel-attacks" style="display:none"></div>
 </div>
 <div id="map-container"><div id="map"></div></div>
+<button id="follow-btn" onclick="toggleFollow()" title="Follow my position">
+ &#127939;
+ <span class="tooltip">Follow Me</span>
+</button>
 
 <script>
 var map,curMarker,netMarkers=[],qrLib=false;
@@ -70,11 +98,103 @@ var map,curMarker,netMarkers=[],qrLib=false;
  document.head.appendChild(s);
 })();
 
+var lastGps=null; /* Cache last known GPS for reconnection gaps */
+var tilesFailed=false;
+var activeTileLayer=null;
+var followMode=false;
+
+function toggleFollow(){
+ followMode=!followMode;
+ var btn=document.getElementById('follow-btn');
+ btn.className=followMode?'active':'';
+ btn.innerHTML=followMode?'\u{1F3AF}<span class="tooltip">Following...</span>':'\u{1F3C3}<span class="tooltip">Follow Me</span>';
+ /* If turning on, immediately pan to current position */
+ if(followMode&&lastGps){
+  map.flyTo([lastGps.lat,lastGps.lon],Math.max(map.getZoom(),16),{duration:0.8});
+ }
+}
+
+/* Disable follow mode when user manually drags the map */
+function initFollowBreaker(){
+ map.on('dragstart',function(){
+  if(followMode){
+   followMode=false;
+   var btn=document.getElementById('follow-btn');
+   btn.className='';
+   btn.innerHTML='\u{1F3C3}<span class="tooltip">Follow Me</span>';
+  }
+ });
+}
+
 function initMap(){
- map=L.map('map').setView([-32.0,115.8],13);
- L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
-  attribution:'&copy; OpenStreetMap',maxZoom:19
- }).addTo(map);
+ map=L.map('map',{zoomControl:true}).setView([-32.0,115.8],13);
+
+ /* === MAP STYLE LAYERS === */
+ var tileLayers={
+  '\u{1F30C} Dark':L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
+   attribution:'&copy; OSM &copy; CARTO',subdomains:'abcd',maxZoom:20}),
+  '\u2600\uFE0F Light':L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{
+   attribution:'&copy; OSM &copy; CARTO',subdomains:'abcd',maxZoom:20}),
+  '\u{1F6E3}\uFE0F Street':L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+   attribution:'&copy; OpenStreetMap',maxZoom:19}),
+  '\u26F0\uFE0F Terrain':L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',{
+   attribution:'&copy; OpenTopoMap &copy; OSM',maxZoom:17}),
+  '\u{1F6F0}\uFE0F Satellite':L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{
+   attribution:'&copy; Esri',maxZoom:19})
+ };
+
+ /* Restore saved preference or default to Dark */
+ var savedStyle=null;
+ try{savedStyle=localStorage.getItem('crackcity_map_style')}catch(e){}
+ var defaultKey=savedStyle&&tileLayers[savedStyle]?savedStyle:'\u{1F30C} Dark';
+ activeTileLayer=tileLayers[defaultKey];
+ activeTileLayer.addTo(map);
+
+ /* Tile error detection for offline fallback */
+ var tileLoaded=false;
+ var tileErrorCount=0;
+ activeTileLayer.on('tileload',function(){tileLoaded=true});
+ activeTileLayer.on('tileerror',function(){
+  tileErrorCount++;
+  if(tileErrorCount>3&&!tilesFailed&&!tileLoaded){
+   tilesFailed=true;showOfflineGrid();
+  }
+ });
+ setTimeout(function(){
+  if(!tileLoaded&&!tilesFailed){tilesFailed=true;showOfflineGrid()}
+ },8000);
+
+ /* Layer control */
+ var layerControl=L.control.layers(tileLayers,null,{position:'topright',collapsed:true}).addTo(map);
+
+ /* Save preference on layer change */
+ map.on('baselayerchange',function(e){
+  activeTileLayer=e.layer;
+  try{localStorage.setItem('crackcity_map_style',e.name)}catch(ex){}
+  /* Reset offline state on layer switch */
+  tileLoaded=false;tilesFailed=false;tileErrorCount=0;
+  var offBanner=document.getElementById('offline-banner');
+  if(offBanner) offBanner.remove();
+  activeTileLayer.on('tileload',function(){tileLoaded=true});
+  activeTileLayer.on('tileerror',function(){
+   tileErrorCount++;
+   if(tileErrorCount>3&&!tilesFailed&&!tileLoaded){
+    tilesFailed=true;showOfflineGrid();
+   }
+  });
+ });
+}
+
+function showOfflineGrid(){
+ /* SVG grid overlay so the map isn't a black void */
+ var gridLayer=L.layerGroup();
+ var infoDiv=document.createElement('div');
+ infoDiv.style.cssText='position:fixed;bottom:10px;right:10px;background:rgba(15,52,96,0.9);color:#e94560;padding:8px 14px;border-radius:6px;font-size:12px;z-index:9999;font-family:monospace';
+ infoDiv.id='offline-banner';
+ infoDiv.textContent='⚡ OFFLINE MODE — No map tiles (mobile data may be unavailable)';
+ document.body.appendChild(infoDiv);
+ /* Set a visible dark background so markers stand out */
+ document.getElementById('map').style.background='#0d1117';
 }
 
 function makeIcon(color,size){
@@ -114,68 +234,108 @@ function loadCrackCity(){
  fetch('/api/crackcity').then(function(r){return r.json()}).then(function(data){
   var s=data.stats||{};
   document.getElementById('stats').innerHTML=
-   '<div class="row"><span>Total handshakes</span><span class="val">'+
-   (s.total||0)+'</span></div>'+
-   '<div class="row"><span>With GPS</span><span class="val">'+
-   (s.with_gps||0)+'</span></div>'+
-   '<div class="row"><span>Cracked</span><span class="val" style="color:'
-   +(s.cracked>0?'#0f0':'#e94560')+'">'+
-   (s.cracked||0)+'</span></div>';
-
-  /* Current GPS position */
+   '<div class="row"><span>APs on map</span><span class="val">'+(s.with_gps||0)+'</span></div>'+
+   '<div class="row"><span>&#128308; Seen only</span><span class="val" style="color:#ff3333">'+(s.seen_only||0)+'</span></div>'+
+   '<div class="row"><span>&#128993; Captured</span><span class="val" style="color:#ffd700">'+((s.handshakes||0)-(s.cracked||0))+'</span></div>'+
+   '<div class="row"><span>&#128994; Cracked</span><span class="val" style="color:#00ff00">'+(s.cracked||0)+'</span></div>';
+  /* Current GPS position — with last-known fallback */
   var g=data.current_gps;
-  if(g&&g.has_fix&&g.lat!==0){
+  /* Cache valid GPS for reconnection gaps */
+  if(g&&g.has_fix&&g.lat!==0&&g.lon!==0){
+   lastGps={lat:g.lat,lon:g.lon,live:true};
+   try{localStorage.setItem('crackcity_last_gps',JSON.stringify(lastGps))}catch(e){}
+  } else if(!lastGps){
+   /* Try restoring from localStorage */
+   try{var saved=localStorage.getItem('crackcity_last_gps');
+    if(saved) lastGps=JSON.parse(saved)}catch(e){}
+  }
+  var showGps=lastGps||(g&&g.lat!==0?{lat:g.lat,lon:g.lon,live:g.has_fix}:null);
+  if(showGps){
    if(curMarker) map.removeLayer(curMarker);
-   curMarker=L.marker([g.lat,g.lon],{icon:makeIcon('#00aaff',18)})
-    .addTo(map).bindPopup('<b>&#128205; Current Position</b>');
-   if(!window._mapCentered){map.setView([g.lat,g.lon],15);window._mapCentered=true}
+   var isLive=showGps.live&&g&&g.has_fix;
+   var markerColor=isLive?'#00aaff':'#ff8800';
+   var markerSize=isLive?18:14;
+   var pulseStyle=isLive?
+    'animation:gpsPulse 2s infinite;':'opacity:0.6;';
+   curMarker=L.marker([showGps.lat,showGps.lon],{
+    icon:L.divIcon({className:'',iconSize:[markerSize+20,markerSize+20],iconAnchor:[(markerSize+20)/2,(markerSize+20)/2],
+     html:'<div style="position:relative;width:'+(markerSize+20)+'px;height:'+(markerSize+20)+'px">'+
+      '<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:'+markerColor+';width:'+markerSize+'px;height:'+markerSize+'px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 12px '+markerColor+',0 0 24px '+markerColor+';'+pulseStyle+'"></div>'+
+      '<div style="position:absolute;top:-18px;left:50%;transform:translateX(-50%);color:#fff;font-size:10px;font-weight:bold;text-shadow:0 0 4px #000,0 0 8px #000;white-space:nowrap">'+(isLive?'📍 LIVE':'⏸ LAST KNOWN')+'</div>'+
+      '</div>'
+    })
+   }).addTo(map).bindPopup('<b>'+(isLive?'📍 Current Position':'⏸ Last Known Position')+'</b><br>'+showGps.lat.toFixed(6)+', '+showGps.lon.toFixed(6));
+   if(!window._mapCentered){map.setView([showGps.lat,showGps.lon],15);window._mapCentered=true}
+   /* Follow mode: keep map centered on position */
+   if(followMode&&isLive){map.panTo([showGps.lat,showGps.lon],{animate:true,duration:0.5})}
   }
 
   /* Clear old markers */
   netMarkers.forEach(function(m){map.removeLayer(m)});
   netMarkers=[];
 
-  var html='';
-  var nets=data.networks||[];
-  /* Sort: cracked first, then by SSID */
-  nets.sort(function(a,b){
-   if(a.cracked!==b.cracked) return a.cracked?-1:1;
-   return a.ssid.localeCompare(b.ssid);
+  /* Map compact JSON keys to readable names */
+  var nets=(data.networks||[]).map(function(n){
+   return {ssid:n.s,bssid:n.b,lat:n.la,lon:n.lo,has_handshake:n.h,cracked:n.c,password:n.p};
   });
 
-  /* Render uncracked first, then cracked (so green dots are on top) */
+  /* === MAP MARKERS: render in layer order (red FIRST at bottom, yellow MIDDLE, green TOP) === */
+  function addMarker(n){
+   if(n.lat===0&&n.lon===0) return;
+   var dotColor=n.cracked?'#00ff00':(n.has_handshake?'#ffd700':'#ff3333');
+   var dotSize=n.cracked?20:(n.has_handshake?16:8);
+   var wifiStr='WIFI:S:'+n.ssid+';T:WPA;P:'+(n.password||'')+';;';
+   var popup='<b>'+n.ssid+'</b><br>BSSID: '+n.bssid+'<br>'+
+    (n.cracked?'<span style="color:#00ff00">&#128275; '+n.password+'</span><br>'+makeQR(wifiStr):
+     (n.has_handshake?'<span style="color:#ffd700">&#128274; Handshake captured</span>':
+      '<span style="color:#ff3333">&#128225; Seen only</span>'));
+   var m=L.marker([n.lat,n.lon],{icon:makeIcon(dotColor,dotSize),zIndexOffset:n.cracked?2000:(n.has_handshake?1000:0)})
+    .addTo(map).bindPopup(popup,{maxWidth:300});
+   netMarkers.push(m);
+  }
+  /* Layer 1: Red dots (seen-only) — added first, sit at bottom */
+  nets.filter(function(n){return !n.has_handshake&&!n.cracked}).forEach(addMarker);
+  /* Layer 2: Yellow dots (captured) — added second, on top of red */
+  nets.filter(function(n){return n.has_handshake&&!n.cracked}).forEach(addMarker);
+  /* Layer 3: Green dots (cracked) — added last, on top of everything */
+  nets.filter(function(n){return n.cracked}).forEach(addMarker);
+
+  /* === SIDEBAR: cracked first, captured second, seen-only last === */
+  var html='';
   nets.sort(function(a,b){
-   if(a.cracked!==b.cracked) return a.cracked?1:-1;
+   var rA=a.cracked?0:(a.has_handshake?1:2);
+   var rB=b.cracked?0:(b.has_handshake?1:2);
+   if(rA!==rB) return rA-rB;
    return a.ssid.localeCompare(b.ssid);
   });
   nets.forEach(function(n){
-   var cls=n.cracked?'cracked':'uncracked';
-   var icon=n.cracked?'&#128275;':'&#128274;';
-   var pwd=n.cracked?n.password:'???';
-   var wifiStr='WIFI:S:'+n.ssid+';T:WPA;P:'+(n.password||'')+';;';
-   var hasGps=n.has_gps&&n.lat!==0&&n.lon!==0;
-
-   html+='<div class="net '+cls+'"'+
-    (hasGps?' onclick="flyTo('+n.lat+','+n.lon+')"':'')+'>'+
+   var status=n.cracked?'cracked':(n.has_handshake?'captured':'seen-only');
+   var dotColor=n.cracked?'#00ff00':(n.has_handshake?'#ffd700':'#ff3333');
+   var icon=n.cracked?'&#128275;':(n.has_handshake?'&#128274;':'&#128225;');
+   var statusText=n.cracked?'PWD: '+n.password:(n.has_handshake?'&#128274; Handshake captured':'&#128225; Seen only');
+   html+='<div class="net '+status+'"'+
+    ' onclick="flyTo('+n.lat+','+n.lon+')">'+
     '<div class="ssid">'+icon+' '+n.ssid+'</div>'+
-    '<div class="pwd">PWD: '+pwd+'</div>'+
-    '<div class="info">'+n.bssid+(hasGps?' | GPS':'')+'</div></div>';
-
-   if(hasGps){
-    var popup='<b>'+n.ssid+'</b><br>BSSID: '+n.bssid+'<br>'+
-     (n.cracked?'<span style="color:green">&#128275; '+n.password+'</span><br>'+
-      makeQR(wifiStr):
-      '<span style="color:red">&#128274; Not cracked</span>');
-    var m=L.marker([n.lat,n.lon],{icon:makeIcon(n.cracked?'#00ff00':'#e94560',n.cracked?18:10),zIndexOffset:n.cracked?1000:0})
-     .addTo(map).bindPopup(popup,{maxWidth:300});
-    netMarkers.push(m);
-   }
+    '<div class="pwd" style="color:'+dotColor+'">'+statusText+'</div>'+
+    '<div class="info">'+n.bssid+' | GPS</div></div>';
   });
   document.getElementById('panel-nets').innerHTML=html||
    '<div style="color:#888;padding:20px">No networks found</div>';
  }).catch(function(e){
   document.getElementById('stats').innerHTML=
-   '<div style="color:red">Error: '+e+'</div>';
+   '<div style="color:#e94560">&#9889; Connection lost — retrying...<br><small>'+e+'</small></div>';
+  /* Still show last known GPS even if API fetch fails */
+  if(lastGps){
+   if(curMarker) map.removeLayer(curMarker);
+   curMarker=L.marker([lastGps.lat,lastGps.lon],{
+    icon:L.divIcon({className:'',iconSize:[34,34],iconAnchor:[17,17],
+     html:'<div style="position:relative;width:34px;height:34px">'+
+      '<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:#ff8800;width:14px;height:14px;border-radius:50%;border:2px solid #fff;opacity:0.6"></div>'+
+      '<div style="position:absolute;top:-18px;left:50%;transform:translateX(-50%);color:#ff8800;font-size:10px;font-weight:bold;text-shadow:0 0 4px #000;white-space:nowrap">⏸ OFFLINE</div></div>'
+    })
+   }).addTo(map).bindPopup('<b>⏸ Last Known Position (offline)</b>');
+   if(!window._mapCentered){map.setView([lastGps.lat,lastGps.lon],15);window._mapCentered=true}
+  }
  });
 }
 
@@ -204,6 +364,7 @@ function loadAttacks(){
 }
 
 initMap();
+initFollowBreaker();
 loadCrackCity();
 setInterval(loadCrackCity,10000);
 </script>

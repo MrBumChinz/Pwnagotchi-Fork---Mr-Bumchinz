@@ -433,6 +433,12 @@ bool stealth_should_rotate_mac(stealth_ctx_t *ctx) {
     /* Check minimum interval */
     if (elapsed < STEALTH_MIN_MAC_INTERVAL) return false;
 
+    /* Exponential backoff after consecutive failures (nexmon locks MAC) */
+    if (ctx->mac_rotation_failures >= 3) {
+        /* After 3+ failures, only retry every 10 minutes */
+        if (elapsed < 600) return false;
+    }
+
     /* Check configured interval */
     return elapsed >= ctx->config.mac_rotation_interval;
 }
@@ -547,7 +553,14 @@ int stealth_rotate_mac(stealth_ctx_t *ctx) {
                 exec_cmd(cmd);
             }
             if (ret != 0) {
-                fprintf(stderr, "[stealth] MAC rotation failed on %s (nexmon locked)\n", base_iface);
+                ctx->mac_rotation_failures++;
+                if (ctx->mac_rotation_failures <= 2) {
+                    fprintf(stderr, "[stealth] MAC rotation failed on %s (nexmon locked)\n", base_iface);
+                } else if (ctx->mac_rotation_failures == 3) {
+                    fprintf(stderr, "[stealth] MAC rotation failed %d times — backing off to 10min retry\n",
+                            ctx->mac_rotation_failures);
+                }
+                /* Failures > 3: silent, retries every 10 min via backoff in should_rotate_mac */
                 return -1;
             }
         }
@@ -562,6 +575,7 @@ int stealth_rotate_mac(stealth_ctx_t *ctx) {
                 ctx->mac_changed = true;
                 ctx->last_mac_change = time(NULL);
                 ctx->total_mac_rotations++;
+                ctx->mac_rotation_failures = 0;  /* Reset backoff on success */
 
                 fprintf(stderr, "[stealth] MAC rotated on %s: %s -> %s\n",
                         base_iface, ctx->original_mac, new_mac);

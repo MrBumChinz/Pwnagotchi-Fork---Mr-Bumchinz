@@ -5,6 +5,7 @@
  * Based on jayofelony's fix_services.py plugin patterns.
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,8 +15,26 @@
 #include <sys/wait.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #include "wifi_recovery.h"
+
+/*
+ * pwnaui sets SIGCHLD to SIG_IGN (auto-reap zombies), which makes
+ * system() and pclose() fail with ECHILD because the kernel reaps
+ * children before waitpid() can collect them.  We must temporarily
+ * restore SIG_DFL around every system()/pclose() call.
+ */
+static void sigchld_save(struct sigaction *old) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGCHLD, &sa, old);
+}
+static void sigchld_restore(const struct sigaction *old) {
+    sigaction(SIGCHLD, old, NULL);
+}
 
 /* Logging helper */
 #define LOG_PREFIX "[wifi_recovery] "
@@ -49,7 +68,10 @@ static const char *DMESG_ERROR_PATTERNS[] = {
  */
 static int exec_cmd(const char *cmd) {
     LOG_DEBUG("exec: %s", cmd);
+    struct sigaction sa_old;
+    sigchld_save(&sa_old);
     int ret = system(cmd);
+    sigchld_restore(&sa_old);
     if (ret == -1) {
         LOG_ERR("system() failed: %s", strerror(errno));
         return -1;
@@ -61,8 +83,11 @@ static int exec_cmd(const char *cmd) {
  * Execute a command and capture output
  */
 static int exec_cmd_output(const char *cmd, char *output, size_t output_len) {
+    struct sigaction sa_old;
+    sigchld_save(&sa_old);
     FILE *fp = popen(cmd, "r");
     if (!fp) {
+        sigchld_restore(&sa_old);
         LOG_ERR("popen() failed: %s", strerror(errno));
         return -1;
     }
@@ -80,6 +105,7 @@ static int exec_cmd_output(const char *cmd, char *output, size_t output_len) {
     }
     
     int status = pclose(fp);
+    sigchld_restore(&sa_old);
     return WEXITSTATUS(status);
 }
 
@@ -133,8 +159,11 @@ static bool check_dmesg_for_errors(void) {
     /* Read dmesg directly from /dev/kmsg is not seekable for tail,
      * so use a simple popen with a very short timeout to prevent zombies.
      * We read the FULL dmesg into a ring buffer, checking only recent lines. */
+    struct sigaction sa_old;
+    sigchld_save(&sa_old);
     FILE *fp = popen("timeout 3 dmesg 2>/dev/null | tail -100", "r");
     if (!fp) {
+        sigchld_restore(&sa_old);
         LOG_ERR("popen(dmesg) failed: %s", strerror(errno));
         return false;
     }
@@ -150,6 +179,7 @@ static bool check_dmesg_for_errors(void) {
     }
     
     int status = pclose(fp);
+    sigchld_restore(&sa_old);
     (void)status;  /* Don't care about exit code - timeout returns 124 */
     
     /* Check for error patterns */

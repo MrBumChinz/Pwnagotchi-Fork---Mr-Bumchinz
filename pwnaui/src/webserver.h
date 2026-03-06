@@ -21,4 +21,10 @@ void webserver_set_state_callback(webserver_state_callback_t cb);
 typedef void (*webserver_gps_callback_t)(double *lat, double *lon, int *has_fix);
 void webserver_set_gps_callback(webserver_gps_callback_t cb);
 
+/* Name-change callback — called when POST /api/config/name updates the name.
+ * The callback receives the new name (already validated & lowercased for hostname).
+ * It should update g_ui_state.name and optionally config.toml. */
+typedef void (*webserver_name_callback_t)(const char *new_name);
+void webserver_set_name_callback(webserver_name_callback_t cb);
+
 #endif /* WEBSERVER_H */

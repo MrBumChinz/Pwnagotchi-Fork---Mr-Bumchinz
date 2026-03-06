@@ -22,8 +22,13 @@
 #include <ctype.h>
 
 /* Rate limiting: one check per AP per 5 minutes */
-#define REFINE_COOLDOWN_SECS 300
-#define REFINE_CACHE_MAX     256
+/* FIX: Reduced cooldown from 300s to 60s.
+ * When walking, you pass APs quickly and the best-RSSI window is narrow.
+ * 5 minutes was too long — by the time cooldown expired, you'd already
+ * walked past and the stronger signal was missed. 60s allows multiple
+ * refinement attempts per walk-by while still preventing spam. */
+#define REFINE_COOLDOWN_SECS 60
+#define REFINE_CACHE_MAX     512
 #define REFINE_MIN_SATS      4    /* Minimum satellites for trustworthy fix */
 
 typedef struct {
@@ -147,39 +152,50 @@ bool gps_refine_check(const char *bssid, int8_t rssi,
     if (!bssid || !gps || !pcap_path || !pcap_path[0])
         return false;
 
-    /* Must have good GPS fix with enough satellites */
-    if (!gps->has_fix || gps->latitude == 0.0 || gps->longitude == 0.0)
+    /* Must have valid GPS coordinates.
+     * Accept either NMEA fix (has_fix=true) or valid coordinates from
+     * the JSON sideband (/tmp/gps.json via BT RFCOMM, updates every 2s).
+     * The NMEA pipeline times out 31% of the time, but coordinates
+     * remain valid from the last fix. */
+    if (gps->latitude == 0.0 && gps->longitude == 0.0) {
+        fprintf(stderr, "[gps-refine] SKIP %s: no GPS coords (0,0)\n", bssid);
         return false;
-    if (gps->satellites < REFINE_MIN_SATS)
-        return false;
+    }
 
-    /* Rate limit: one check per AP per 5 minutes */
+    /* Rate limit: one check per AP per 60 seconds */
     refine_entry_t *entry = get_refine_entry(bssid);
-    if (!entry) return false;
+    if (!entry) {
+        fprintf(stderr, "[gps-refine] SKIP %s: cache full\n", bssid);
+        return false;
+    }
 
     time_t now = time(NULL);
-    if (now - entry->last_checked < REFINE_COOLDOWN_SECS)
-        return false;
+    if (now - entry->last_checked < REFINE_COOLDOWN_SECS) {
+        return false;  /* Silent skip — rate limit, fires every scan cycle */
+    }
     entry->last_checked = now;
 
     /* Derive .gps.json path from .pcap path */
     char gps_path[512];
-    if (!derive_gps_path(pcap_path, gps_path, sizeof(gps_path)))
+    if (!derive_gps_path(pcap_path, gps_path, sizeof(gps_path))) {
+        fprintf(stderr, "[gps-refine] SKIP %s: bad pcap path\n", bssid);
         return false;
+    }
 
     /* Check if GPS JSON file exists */
     struct stat st;
     if (stat(gps_path, &st) != 0) {
-        /* No GPS file yet — create one if signal is decent (> -70 dBm) */
-        if (rssi > -70) {
-            if (write_gps_json(gps_path, gps->latitude, gps->longitude,
-                               gps->altitude, gps->hdop, rssi)) {
-                entry->best_rssi = rssi;
-                refine_total_updates++;
-                fprintf(stderr, "[gps-refine] NEW GPS for %s @ %ddBm (%.6f, %.6f)\n",
-                        bssid, rssi, gps->latitude, gps->longitude);
-                return true;
-            }
+        /* No GPS file yet — create one.
+         * FIX: Removed -70dBm gate. Even weak signals are better than no GPS
+         * data at all. The position might not be perfectly accurate for distant
+         * APs, but it marks the general area and will be refined on closer pass. */
+        if (write_gps_json(gps_path, gps->latitude, gps->longitude,
+                           gps->altitude, gps->hdop, rssi)) {
+            entry->best_rssi = rssi;
+            refine_total_updates++;
+            fprintf(stderr, "[gps-refine] NEW GPS for %s @ %ddBm (%.6f, %.6f)\n",
+                    bssid, rssi, gps->latitude, gps->longitude);
+            return true;
         }
         return false;
     }

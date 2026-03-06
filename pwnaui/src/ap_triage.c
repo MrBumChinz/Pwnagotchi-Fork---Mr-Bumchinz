@@ -94,13 +94,8 @@ void ap_triage_classify(const ap_triage_input_t *input,
 
     /* ── SKIP tier: hard filters ─────────────────────────────────── */
 
-    if (input->is_whitelisted) {
-        result->tier = TRIAGE_SKIP;
-        result->time_budget_pct = TRIAGE_BUDGET_SKIP;
-        result->priority_score = 0.0f;
-        result->reason = "whitelisted";
-        return;
-    }
+    /* Whitelisted APs are now attacked until captured (skip-after-capture).
+     * The whitelist is used for auto-connect PSK storage only. */
 
     if (input->is_blacklisted) {
         result->tier = TRIAGE_SKIP;
@@ -241,10 +236,10 @@ float ap_triage_score(const ap_triage_input_t *input)
         score += 0.15f;
 
     /* Penalty for high deauth count (diminishing returns) */
-    if (input->deauth_count > 10)
-        score *= 0.85f;
-    else if (input->deauth_count > 20)
+    if (input->deauth_count > 20)
         score *= 0.70f;
+    else if (input->deauth_count > 10)
+        score *= 0.85f;
 
     /* Clamp */
     if (score < 0.0f) score = 0.0f;

@@ -55,6 +55,10 @@ typedef struct {
     long timestamp;
     double accel;       // RMS linear acceleration m/s² (from phone accelerometer)
     int steps;          // Cumulative step count (from phone step counter)
+    char activity[16];  // Android Activity Recognition: STILL/WALKING/IN_VEHICLE/etc
+    int activity_confidence;  // 0-100 confidence from Activity Recognition API
+    double displacement_speed; // m/s from GPS position changes (Samsung Doppler fallback)
+    char calibration[4];  // Ground truth from app calibration UI: STA/WLK/DRV or empty
     int valid;
 } gps_data_t;
 
@@ -63,6 +67,9 @@ static pthread_mutex_t gps_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int udp_sock = -1;
 static struct sockaddr_in pwnaui_addr;
 static volatile int bt_connected = 0;  // Track BT connection state
+static volatile int active_client_fd = -1;  // Current client socket (-1 = none)
+static time_t last_connect_log = 0;
+static time_t last_disconnect_log = 0;
 
 // Raw NMEA passthrough tracking: when the phone sends real GNSS NMEA
 // (with chipset Doppler speed), don't generate synthetic VTG/RMC that
@@ -205,6 +212,27 @@ sdp_session_t *register_service(uint8_t rfcomm_channel) {
     return session;
 }
 
+// Simple JSON string parser — copies value into buf (max buflen-1 chars)
+int parse_json_string(const char *json, const char *key, char *buf, int buflen) {
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    char *pos = strstr(json, search);
+    if (!pos) { buf[0] = '\0'; return -1; }
+    pos = strchr(pos, ':');
+    if (!pos) { buf[0] = '\0'; return -1; }
+    pos++;
+    while (*pos == ' ' || *pos == '\t') pos++;
+    if (*pos != '"') { buf[0] = '\0'; return -1; }
+    pos++;  // skip opening quote
+    char *end = strchr(pos, '"');
+    if (!end) { buf[0] = '\0'; return -1; }
+    int len = (int)(end - pos);
+    if (len >= buflen) len = buflen - 1;
+    memcpy(buf, pos, len);
+    buf[len] = '\0';
+    return len;
+}
+
 // Simple JSON number parser
 double parse_json_number(const char *json, const char *key) {
     char search[64];
@@ -336,6 +364,10 @@ int parse_gps_json(const char *json, gps_data_t *gps) {
     gps->timestamp = (long)parse_json_number(json, "timestamp");
     gps->accel = parse_json_number(json, "accel");
     gps->steps = (int)parse_json_number(json, "steps");
+    parse_json_string(json, "activity", gps->activity, sizeof(gps->activity));
+    gps->activity_confidence = (int)parse_json_number(json, "activityConfidence");
+    gps->displacement_speed = parse_json_number(json, "displacementSpeed");
+    parse_json_string(json, "calibration", gps->calibration, sizeof(gps->calibration));
     
     // Validate - latitude and longitude should be non-zero for valid GPS
     if (gps->latitude != 0.0 || gps->longitude != 0.0) {
@@ -344,6 +376,56 @@ int parse_gps_json(const char *json, gps_data_t *gps) {
     }
     
     return -1;
+}
+
+/* Forward declaration — write_gps_file defined below */
+void write_gps_file(const gps_data_t *gps);
+
+/**
+ * Handle sensor-only packets from the companion app.
+ * When GPS has no fix, the app sends {"sensorOnly":true, "accel":X, "steps":Y}
+ * every 3 seconds. We update accel/steps in current_gps and rewrite gps.json
+ * so the mobility detection always has fresh sensor data.
+ * Returns 1 if handled, 0 if not a sensor-only packet.
+ */
+int handle_sensor_only(const char *json) {
+    if (!json) return 0;
+    if (!strstr(json, "sensorOnly")) return 0;
+    
+    float accel = (float)parse_json_number(json, "accel");
+    int steps = (int)parse_json_number(json, "steps");
+    double disp_speed = parse_json_number(json, "displacementSpeed");
+    char activity[16] = {0};
+    int activity_conf = 0;
+    parse_json_string(json, "activity", activity, sizeof(activity));
+    activity_conf = (int)parse_json_number(json, "activityConfidence");
+    char calibration[4] = {0};
+    parse_json_string(json, "calibration", calibration, sizeof(calibration));
+    
+    pthread_mutex_lock(&gps_mutex);
+    current_gps.accel = accel;
+    current_gps.steps = steps;
+    current_gps.displacement_speed = disp_speed;
+    if (activity[0]) {
+        strncpy(current_gps.activity, activity, sizeof(current_gps.activity) - 1);
+        current_gps.activity_confidence = activity_conf;
+    }
+    if (calibration[0]) {
+        strncpy(current_gps.calibration, calibration, sizeof(current_gps.calibration) - 1);
+    } else {
+        current_gps.calibration[0] = '\0';
+    }
+    // Rewrite GPS file with updated sensor data (preserves last known position)
+    write_gps_file(&current_gps);
+    pthread_mutex_unlock(&gps_mutex);
+    
+    static unsigned int sensor_only_count = 0;
+    sensor_only_count++;
+    if ((sensor_only_count % 20) == 1) {
+        printf("[SENSOR] Sensor-only update #%u: accel=%.2f steps=%d\n",
+               sensor_only_count, accel, steps);
+    }
+    return 1;
 }
 
 // Write GPS data to file
@@ -363,6 +445,12 @@ void write_gps_file(const gps_data_t *gps) {
         fprintf(f, "  \"Bearing\": %.2f,\n", gps->bearing);
         fprintf(f, "  \"Accel\": %.3f,\n", gps->accel);
         fprintf(f, "  \"Steps\": %d,\n", gps->steps);
+        fprintf(f, "  \"Activity\": \"%s\",\n", gps->activity[0] ? gps->activity : "");
+        fprintf(f, "  \"ActivityConfidence\": %d,\n", gps->activity_confidence);
+        fprintf(f, "  \"DisplacementSpeed\": %.3f,\n", gps->displacement_speed);
+        if (gps->calibration[0]) {
+            fprintf(f, "  \"Calibration\": \"%s\",\n", gps->calibration);
+        }
         fprintf(f, "  \"Updated\": %ld,\n", now);
         fprintf(f, "  \"FixQuality\": 1\n");
         fprintf(f, "}\n");
@@ -480,10 +568,16 @@ void *handle_client(void *arg) {
     
     getpeername(client_sock, (struct sockaddr *)&rem_addr, &opt);
     ba2str(&rem_addr.rc_bdaddr, client_addr);
-    printf("Connected: %s\n", client_addr);
+    // Rate-limit connect logging (max 1 per 5s)
+    time_t now_conn = time(NULL);
+    if (now_conn - last_connect_log >= 5) {
+        printf("Connected: %s\n", client_addr);
+        last_connect_log = now_conn;
+    }
     
     // Notify pwnaui of BT connection
     bt_connected = 1;
+    active_client_fd = client_sock;
     update_bt_status(1);
     
     while (running) {
@@ -502,10 +596,14 @@ void *handle_client(void *arg) {
         // Process each line (may have multiple JSON objects)
         char *line = strtok(buffer, "\n");
         while (line) {
-            // Handle keepalive pings from companion app (just ACK, don't process)
+            // Handle keepalive pings from companion app (no ACK — phone doesn't read inputStream)
             if (strstr(line, "\"keepalive\"")) {
-                const char *ack = "{\"status\":\"ok\"}\n";
-                write(client_sock, ack, strlen(ack));
+                line = strtok(NULL, "\n");
+                continue;
+            }
+
+            // Handle sensor-only packets (accel+steps without GPS position)
+            if (handle_sensor_only(line)) {
                 line = strtok(NULL, "\n");
                 continue;
             }
@@ -540,19 +638,24 @@ void *handle_client(void *arg) {
                     last_logged_lon = gps.longitude;
                 }
                 
-                // Send ACK back to phone
-                const char *ack = "{\"status\":\"ok\"}\n";
-                write(client_sock, ack, strlen(ack));
+                // No ACK — phone app doesn't read inputStream.
+                // Sending ACKs fills RFCOMM buffer → flow control → link reset.
             }
             
             line = strtok(NULL, "\n");
         }
     }
     
-    printf("Disconnected: %s\n", client_addr);
+    // Rate-limit disconnect logging (max 1 per 5s)
+    time_t now_disc = time(NULL);
+    if (now_disc - last_disconnect_log >= 5) {
+        printf("Disconnected: %s\n", client_addr);
+        last_disconnect_log = now_disc;
+    }
     
     // Notify pwnaui of BT disconnection
     bt_connected = 0;
+    active_client_fd = -1;
     update_bt_status(0);
     update_gps_status(NULL);  // Also mark GPS as disconnected
     
@@ -572,6 +675,7 @@ int main(int argc, char **argv) {
     // Setup signal handlers
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);  // Ignore SIGPIPE — write() to closed RFCOMM socket must not kill us
     
     // Create UDP socket for forwarding GPS to pwnaui
     udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -637,12 +741,19 @@ int main(int argc, char **argv) {
         struct sockaddr_rc rem_addr = {0};
         socklen_t rem_len = sizeof(rem_addr);
         
+        // Close stale client before accepting new connection
+        if (active_client_fd >= 0) {
+            close(active_client_fd);
+            active_client_fd = -1;
+        }
+        
         // Accept connection
         int client_sock = accept(server_sock, (struct sockaddr *)&rem_addr, &rem_len);
         
         if (client_sock < 0) {
             if (errno == EINTR || !running) break;
             perror("Accept failed");
+            usleep(500000);  // 500ms debounce on accept errors
             continue;
         }
         

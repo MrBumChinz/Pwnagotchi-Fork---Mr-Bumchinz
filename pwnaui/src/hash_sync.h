@@ -1,9 +1,18 @@
 /*
- * hash_sync.h - GitHub Community Hash Sharing
+ * hash_sync.h - GitHub Community Hash & Wordlist Sharing
  *
- * Sprint 8: Automatic sync of .22000 hash files to a shared GitHub repo.
+ * Sprint 8: Automatic sync of .22000 hash files + wordlists to a shared GitHub repo.
  * Push new hashes, pull community cracked passwords.
+ * Push/pull community.txt and learned.txt wordlists (fleet sync).
  * Runs when internet is available (home mode or hotspot "2nd home").
+ *
+ * Repo structure:
+ *   uncracked/SSID_bssid.22000     - hashcat-ready files
+ *   uncracked/SSID_bssid.meta      - JSON metadata (GPS, encryption, etc.)
+ *   cracked/SSID_bssid.22000       - cracked (kept for reference)
+ *   cracked/SSID_bssid.potfile     - BSSID:password
+ *   wordlists/community.txt        - Fleet whitelist passwords (merged)
+ *   wordlists/learned.txt          - Fleet cracked passwords (merged)
  */
 #ifndef HASH_SYNC_H
 #define HASH_SYNC_H
@@ -29,6 +38,7 @@ typedef struct {
     int  hashes_pushed;
     int  hashes_pulled;
     int  passwords_imported;
+    int  wordlists_synced;     /* community.txt + learned.txt merge count */
     bool success;
     time_t sync_time;
     char error[256];

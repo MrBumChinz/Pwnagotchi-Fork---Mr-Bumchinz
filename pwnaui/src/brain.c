@@ -25,6 +25,7 @@
 #include <dirent.h>
 
 #include "brain.h"
+#include "thompson_v3.h"
 #include "pcapng_gps.h"
 #include "pcap_check.h"
 #include "hc22000.h"
@@ -85,6 +86,15 @@ static void brain_eapol_callback(const uint8_t *bssid,
         ts_observe_outcome(entity, true, reward);
         fprintf(stderr, "[brain] [eapol-cb] %s captured (type=%d score=%d) -> Thompson rewarded\n",
                 mac_str, (int)type, quality ? quality->score : 0);
+
+        /* v3.0: Full observation update with reward shaping */
+        if (ctx->v3) {
+            int entity_idx = (int)(entity - ctx->thompson->entities);
+            v3_reward_level_t rlevel = (quality && quality->score > 50)
+                ? REWARD_HANDSHAKE : REWARD_EAPOL_PARTIAL;
+            v3_observe(ctx->v3, ctx->thompson, entity, entity_idx,
+                       rlevel, ctx->last_lat, ctx->last_lon);
+        }
     }
 
     /* Record in channel map */
@@ -141,11 +151,10 @@ static void update_mobility(brain_ctx_t *ctx) {
      * Raw per-epoch churn oscillates wildly (0.55 → 0.08 → 0.31) because
      * walking adds APs gradually, not all at once. Smoothing prevents the
      * hysteresis counter from resetting every other epoch. */
-    static float smoothed_churn = 0.0f;
     {
         float raw_churn = (ctx->total_aps > 0) ? (float)ap_delta / (float)ctx->total_aps : 0.0f;
         if (raw_churn > 1.0f) raw_churn = 1.0f;
-        smoothed_churn = 0.7f * raw_churn + 0.3f * smoothed_churn;
+        ctx->smoothed_churn = 0.7f * raw_churn + 0.3f * ctx->smoothed_churn;
     }
 
     if (ctx->mobility_score > 0.3f) {
@@ -154,10 +163,9 @@ static void update_mobility(brain_ctx_t *ctx) {
     }
 
     /* Suppress mode detection for first few seconds after boot (churn from 0→N is misleading) */
-    static int mobility_boot_skips = 1;  /* Skip first check only (2s at 2s interval) */
-    if (mobility_boot_skips > 0) {
-        mobility_boot_skips--;
-        fprintf(stderr, "[brain] [mobility-dbg] BOOT GRACE: skipping mode detection (%d left)\n", mobility_boot_skips);
+    if (ctx->mobility_boot_skips > 0) {
+        ctx->mobility_boot_skips--;
+        fprintf(stderr, "[brain] [mobility-dbg] BOOT GRACE: skipping mode detection (%d left)\n", ctx->mobility_boot_skips);
         return;
     }
 
@@ -169,10 +177,19 @@ static void update_mobility(brain_ctx_t *ctx) {
         gps_speed_kmh = (float)ctx->gps->speed_kmh;
     }
 
-    /* Read accelerometer + step count from /tmp/gps.json (written by bt_gps_receiver).
-     * These come from Android's SensorManager, not NMEA, so they're in the JSON sideband. */
+    /* Read accelerometer + step count + speed from /tmp/gps.json
+     * (written by bt_gps_receiver every ~2s from BT RFCOMM).
+     * Accel/Steps come from Android SensorManager, not NMEA.
+     * Speed from Android Location.getSpeed() is a fallback when NMEA has no fix.
+     * NOTE: JSON position haversine was tried but REMOVED — GPS accuracy ~22m
+     * means position jitter between 2 readings produces 30+ km/h phantom speed.
+     * The gps.c haversine uses a 5-sample ring buffer which averages out jitter. */
     float phone_accel = 0.0f;
     int phone_steps = 0;
+    float json_speed_kmh = -1.0f;
+    char phone_activity[16] = {0};
+    int phone_activity_conf = 0;
+    float displacement_speed_ms = -1.0f;
     {
         FILE *gf = fopen("/tmp/gps.json", "r");
         if (gf) {
@@ -180,18 +197,95 @@ static void update_mobility(brain_ctx_t *ctx) {
             size_t n = fread(buf, 1, sizeof(buf) - 1, gf);
             buf[n] = '\0';
             fclose(gf);
-            /* Quick parse: find "Accel": and "Steps": */
+            /* Quick parse: find "Accel":, "Steps":, "Speed":, "Activity":, "ActivityConfidence": */
             const char *ap = strstr(buf, "\"Accel\":");
             if (ap) phone_accel = (float)atof(ap + 8);
             const char *sp = strstr(buf, "\"Steps\":");
             if (sp) phone_steps = atoi(sp + 8);
+
+            /* Parse phone Activity Recognition results */
+            const char *act = strstr(buf, "\"Activity\":");
+            if (act) {
+                const char *q1 = strchr(act + 11, '"');
+                if (q1) {
+                    q1++;
+                    const char *q2 = strchr(q1, '"');
+                    if (q2 && (q2 - q1) < 16) {
+                        memcpy(phone_activity, q1, q2 - q1);
+                        phone_activity[q2 - q1] = '\0';
+                    }
+                }
+            }
+            const char *actc = strstr(buf, "\"ActivityConfidence\":");
+            if (actc) phone_activity_conf = atoi(actc + 21);
+
+            /* Calibration ground truth from app ("STA", "WLK", "DRV", or absent) */
+            const char *cal = strstr(buf, "\"Calibration\":");
+            if (cal) {
+                const char *cq1 = strchr(cal + 15, '"');
+                if (cq1) {
+                    cq1++;
+                    const char *cq2 = strchr(cq1, '"');
+                    if (cq2 && (cq2 - cq1) <= 4) {
+                        char cal_mode[5] = {0};
+                        memcpy(cal_mode, cq1, cq2 - cq1);
+                        mobility_mode_set_calibration(&ctx->mobility_ctx, cal_mode);
+                    }
+                }
+            } else {
+                /* Field absent → clear stale calibration */
+                mobility_mode_set_calibration(&ctx->mobility_ctx, "");
+            }
+
+            /* Displacement speed — calculated from GPS position changes by
+             * the Android companion app. This is the ultimate fallback when
+             * Samsung's sensor hub freezes the Doppler speed. */
+            const char *dsp = strstr(buf, "\"DisplacementSpeed\":");
+            if (dsp) displacement_speed_ms = (float)atof(dsp + 20);
+
+            const char *upd = strstr(buf, "\"Updated\":");
+            long now_ts = (long)time(NULL);
+            bool json_fresh = false;
+            if (upd) {
+                long updated_ts = atol(upd + 10);
+                json_fresh = ((now_ts - updated_ts) < 10);
+            }
+
+            /* Android Location.getSpeed() — fallback when NMEA has no fix */
+            const char *spd = strstr(buf, "\"Speed\":");
+            if (spd && json_fresh) {
+                float v = (float)atof(spd + 8);
+                json_speed_kmh = v * 3.6f;     /* m/s → km/h */
+            }
         }
     }
 
+    /* Speed source priority:
+     * 1. Phone JSON Speed (Location.getSpeed() — Doppler-derived, accurate.
+     *    This is what every speed app in the world uses.)
+     * 2. NMEA speed (from gps.c — fallback only when phone JSON is stale)
+     * 3. -1.0 = no GPS data available
+     *
+     * DisplacementSpeed REMOVED — it's calculated from GPS position changes
+     * with ~15m accuracy, producing phantom 5-26 km/h while stationary.
+     * Both NMEA Doppler and Android Location.getSpeed() correctly report 0. */
+    if (json_speed_kmh >= 0.0f) {
+        gps_speed_kmh = json_speed_kmh;  /* Phone speed is primary */
+    }
+    /* else: keep NMEA speed as fallback (better than nothing) */
+
     /* Use smoothed AP churn, not raw per-epoch delta.
      * Raw churn oscillates too wildly for hysteresis to work. */
+
+    /* V2: Feed phone Activity Recognition to mobility detector BEFORE update.
+     * When the phone sends a valid activity (e.g. IN_VEHICLE/WALKING/STILL),
+     * it takes priority over raw GPS speed in classify(). */
+    if (phone_activity[0]) {
+        mobility_mode_set_activity(&ctx->mobility_ctx, phone_activity, phone_activity_conf);
+    }
+
     if (mobility_mode_update(&ctx->mobility_ctx, gps_speed_kmh,
-                             ctx->mobility_score, smoothed_churn, ctx->total_aps,
+                             ctx->mobility_score, ctx->smoothed_churn, ctx->total_aps,
                              phone_accel, phone_steps)) {
         /* Mode changed — apply new parameters to brain config */
         const mobility_params_t *p = mobility_mode_get_params(&ctx->mobility_ctx);
@@ -259,13 +353,13 @@ static void update_mobility(brain_ctx_t *ctx) {
         }
     }
 
-    /* Debug: always log mobility inputs AFTER update (so smoothed_speed is current) */
-    fprintf(stderr, "[brain] [mobility-dbg] raw=%.1f smooth=%.1fkm/h accel=%.2f steps=%d score=%.2f churn=%.2f(s=%.2f delta=%d/aps=%d) mode=%s\n",
+    /* Debug: always log mobility inputs AFTER update */
+    fprintf(stderr, "[brain] [mobility-dbg] raw=%.1fkm/h accel=%.2f steps=%d act=%s(%d%%) score=%.2f churn=%.2f(s=%.2f delta=%d/aps=%d) mode=%s\n",
             gps_speed_kmh,
-            ctx->mobility_ctx.smoothed_speed,
             phone_accel, phone_steps,
+            phone_activity[0] ? phone_activity : "NONE", phone_activity_conf,
             ctx->mobility_score, 
-            smoothed_churn,
+            ctx->smoothed_churn,
             (ctx->total_aps > 0) ? (float)ap_delta / (float)ctx->total_aps : 0.0f,
             ap_delta, ctx->total_aps,
             mobility_mode_label(ctx->mobility_ctx.current_mode));
@@ -387,112 +481,11 @@ static bool geo_fence_check(brain_ctx_t *ctx) {
     return inside;
 }
 
-/* Check if home SSID is visible and strong enough for home mode (#12) */
-static bool check_home_network(brain_ctx_t *ctx) {
-    if (ctx->config.home_ssid[0] == '\0') return false;  /* No home SSID configured */
-
-    int ap_count = bcap_get_ap_count(ctx->bcap);
-    for (int i = 0; i < ap_count; i++) {
-        bcap_ap_t ap;
-        if (bcap_get_ap(ctx->bcap, i, &ap) != 0) continue;
-        if (strcasecmp(ap.ssid, ctx->config.home_ssid) == 0) {
-            if (ap.rssi >= ctx->config.home_min_rssi) {
-                return true;  /* Home network visible and strong */
-            }
-        }
-    }
-    return false;
-}
-
-/* Enter home mode: pause attacks, optionally connect to home network */
-static void enter_home_mode(brain_ctx_t *ctx) {
-    if (ctx->home_mode_active) return;
-    ctx->home_mode_active = true;
-    ctx->home_mode_entered = time(NULL);
-    fprintf(stderr, "[brain] [home] HOME MODE ACTIVATED — pausing attacks (SSID: %s)\n",
-            ctx->config.home_ssid);
-
-    /* If PSK is configured, attempt connection.
-     * This is a best-effort connection — we don't block the brain thread.
-     * The actual connection happens asynchronously via system() */
-    if (ctx->config.home_psk[0] != '\0') {
-        /* Create temporary wpa_supplicant config */
-        FILE *f = fopen("/tmp/pwnaui_home.conf", "w");
-        if (f) {
-            fprintf(f, "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n");
-            fprintf(f, "update_config=1\n");
-            fprintf(f, "country=AU\n\n");
-            fprintf(f, "network={\n");
-            fprintf(f, "    ssid=\"%s\"\n", ctx->config.home_ssid);
-            fprintf(f, "    psk=\"%s\"\n", ctx->config.home_psk);
-            fprintf(f, "    key_mgmt=WPA-PSK\n");
-            fprintf(f, "}\n");
-            fclose(f);
-            /* Note: actual managed-mode connection is complex and
-             * requires stopping monitor mode. For now, we just pause
-             * attacks and log. Full auto-connect can be added later. */
-            fprintf(stderr, "[brain] [home] config written to /tmp/pwnaui_home.conf\n");
-        }
-    }
-}
-
-/* Exit home mode: resume attacks */
-static void exit_home_mode(brain_ctx_t *ctx) {
-    if (!ctx->home_mode_active) return;
-    long duration = (long)(time(NULL) - ctx->home_mode_entered);
-    ctx->home_mode_active = false;
-    ctx->home_mode_entered = 0;
-    fprintf(stderr, "[brain] [home] HOME MODE DEACTIVATED — resuming attacks (was home for %lds)\n", duration);
-}
-
-/* Sprint 8: Check if 2nd home (hotspot) SSID is visible */
-static bool check_home2_network(brain_ctx_t *ctx) {
-    if (ctx->config.home2_ssid[0] == '\0') return false;
-    int ap_count = bcap_get_ap_count(ctx->bcap);
-    for (int i = 0; i < ap_count; i++) {
-        bcap_ap_t ap;
-        if (bcap_get_ap(ctx->bcap, i, &ap) != 0) continue;
-        if (strcasecmp(ap.ssid, ctx->config.home2_ssid) == 0) {
-            if (ap.rssi >= ctx->config.home2_min_rssi) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-/* Sprint 8: Enter 2nd home mode (hotspot) - pause attacks, get internet */
-static void enter_home2_mode(brain_ctx_t *ctx) {
-    if (ctx->home2_mode_active) return;
-    ctx->home2_mode_active = true;
-    ctx->home2_mode_entered = time(NULL);
-    fprintf(stderr, "[brain] [home2] 2ND HOME (hotspot) ACTIVATED - pausing attacks (SSID: %s)\n",
-        ctx->config.home2_ssid);
-    if (ctx->config.home2_psk[0] != '\0') {
-        FILE *f = fopen("/tmp/pwnaui_home2.conf", "w");
-        if (f) {
-            fprintf(f, "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n");
-            fprintf(f, "update_config=1\n");
-            fprintf(f, "country=AU\n\n");
-            fprintf(f, "network={\n");
-            fprintf(f, "    ssid=\"%s\"\n", ctx->config.home2_ssid);
-            fprintf(f, "    psk=\"%s\"\n", ctx->config.home2_psk);
-            fprintf(f, "    key_mgmt=WPA-PSK\n");
-            fprintf(f, "}\n");
-            fclose(f);
-            fprintf(stderr, "[brain] [home2] config written to /tmp/pwnaui_home2.conf\n");
-        }
-    }
-}
-
-/* Sprint 8: Exit 2nd home mode */
-static void exit_home2_mode(brain_ctx_t *ctx) {
-    if (!ctx->home2_mode_active) return;
-    long duration = (long)(time(NULL) - ctx->home2_mode_entered);
-    ctx->home2_mode_active = false;
-    ctx->home2_mode_entered = 0;
-    fprintf(stderr, "[brain] [home2] 2ND HOME DEACTIVATED - resuming attacks (was connected for %lds)\n", duration);
-}
+/* Home mode REMOVED — replaced by automatic skip-after-capture system.
+ * APs are attacked until a full handshake is captured, then automatically
+ * skipped via the 3-layer check: pcap cache + EAPOL monitor + failure blacklist.
+ * When all visible APs have been captured, the brain enters bored/idle state
+ * naturally. Whitelist PSK data lives in stealth config for future auto-connect. */
 #include "crack_manager.h"
 #include "health_monitor.h"
 #include <sys/stat.h>
@@ -620,15 +613,7 @@ brain_config_t brain_config_default(void) {
         /* Bond system */
         .bond_encounters_factor = 100.0f,
 
-        /* Home mode (#12) */
-        .home_ssid = "Telstra9A08D8",            /* Home WiFi */
-        .home_psk = "43k7eq9ngue574us",             /* Home PSK */
-        .home_min_rssi = -60,
-
-    /* Sprint 8: 2nd Home (hotspot for internet access) */
-    .home2_ssid = "HotspotVirus.exe",
-    .home2_psk = "00000000",
-    .home2_min_rssi = -65,
+        /* Home mode REMOVED — auto skip-after-capture handles idle detection */
 
     /* Sprint 8: Hash sync (disabled by default) */
     .sync_config = { .github_repo = "MrBumChinz/Hash-Den", .github_token = "", .contributor_name = "pwnagotchi",
@@ -802,6 +787,9 @@ static void adapt_epoch_timing(brain_ctx_t *ctx) {
 }
 
 void brain_epoch_next(brain_ctx_t *ctx) {
+    /* Invalidate per-epoch caches */
+    ctx->bored_cache_valid = false;
+
     /* Sprint 7 #20: Adapt timing based on conditions */
     adapt_epoch_timing(ctx);
 
@@ -861,6 +849,21 @@ void brain_epoch_next(brain_ctx_t *ctx) {
     if (ctx->thompson && (e->epoch_num % 10) == 0 && e->epoch_num > 0) {
         ts_save_state(ctx->thompson, "/etc/pwnagotchi/brain_state.bin");
         fprintf(stderr, "[brain] Thompson state saved (epoch %d)\n", e->epoch_num);
+    }
+
+    /* v3.0: Save v3 binary state + export JSON for PC sync every 10 epochs */
+    if (ctx->v3 && (e->epoch_num % 10) == 0 && e->epoch_num > 0) {
+        v3_save_state(ctx->v3, "/var/lib/pwnagotchi/v3_brain.bin");
+        v3_state_export_json(ctx->v3, ctx->thompson,
+                             "/var/lib/pwnagotchi/v3_export.json");
+        fprintf(stderr, "[brain] v3.0 state saved + exported (epoch %d)\n",
+                e->epoch_num);
+
+        /* Re-check for fresh PC distillation each save cycle */
+        if (v3_distillation_import(ctx->v3, ctx->thompson,
+                                   "/tmp/pc_distillation_v3.json") == 0) {
+            fprintf(stderr, "[brain] v3.0 PC distillation re-imported\n");
+        }
     }
 
     /* Advance epoch */
@@ -980,14 +983,23 @@ static void brain_hulk_smash(brain_ctx_t *ctx) {
 }
 
 /* SMART BORED CHECK: Only be bored if ALL visible APs have FULL handshakes
- * Why be bored if there's still work to do? */
+ * Why be bored if there's still work to do?
+ * Performance: result is cached per-epoch (called 5 times, scan_handshake_stats
+ * and bcap iteration are expensive on Pi Zero). Cache invalidated in brain_epoch_next(). */
 static bool should_really_be_bored(brain_ctx_t *ctx) {
+    /* Return cached result if still valid this epoch */
+    if (ctx->bored_cache_valid) {
+        return ctx->bored_cached_result;
+    }
+
     /* Update handshake quality cache */
     scan_handshake_stats();
     
     int ap_count = bcap_get_ap_count(ctx->bcap);
     if (ap_count == 0) {
         /* No APs visible = lonely, not bored */
+        ctx->bored_cache_valid = true;
+        ctx->bored_cached_result = false;
         return false;
     }
     
@@ -1033,17 +1045,23 @@ static bool should_really_be_bored(brain_ctx_t *ctx) {
     /* Only be TRULY bored if we've conquered ALL visible APs */
     if (aps_needing_handshakes > 0) {
         fprintf(stderr, "[brain] NOT BORED: %d APs still need handshakes!\n", aps_needing_handshakes);
+        ctx->bored_cache_valid = true;
+        ctx->bored_cached_result = false;
         return false;
     }
     
     /* If we have partials, we could upgrade them - not really bored */
     if (aps_with_partial > 0) {
         fprintf(stderr, "[brain] NOT BORED: %d partials could be upgraded\n", aps_with_partial);
+        ctx->bored_cache_valid = true;
+        ctx->bored_cached_result = false;
         return false;
     }
     
     /* All visible APs have FULL handshakes - CONQUEST COMPLETE! */
     fprintf(stderr, "[brain] TRULY BORED: all %d visible APs have full handshakes!\n", aps_with_full);
+    ctx->bored_cache_valid = true;
+    ctx->bored_cached_result = true;
     return true;
 }
 
@@ -1502,11 +1520,20 @@ static void observe_attack_outcome(brain_attack_tracker_t *tracker, int phase, b
     } else {
         tracker->atk_beta[phase] += 0.3f;  /* Smaller penalty for failure (exploration-friendly) */
     }
-    /* Cap to prevent overflow and maintain exploration */
-    if (tracker->atk_alpha[phase] > 50.0f) {
+    /* Cap total evidence (ESS) to prevent overflow and maintain exploration.
+     * Check alpha+beta (effective sample size), not just alpha alone. */
+    if (tracker->atk_alpha[phase] + tracker->atk_beta[phase] > 50.0f) {
         tracker->atk_alpha[phase] *= 0.8f;
         tracker->atk_beta[phase]  *= 0.8f;
     }
+}
+
+/* qsort comparator: sort candidates by RSSI descending (strongest first) */
+static int cmp_candidate_rssi(const void *a, const void *b) {
+    const ts_entity_t *ea = *(const ts_entity_t *const *)a;
+    const ts_entity_t *eb = *(const ts_entity_t *const *)b;
+    /* Descending: higher RSSI first */
+    return (eb->last_rssi > ea->last_rssi) - (eb->last_rssi < ea->last_rssi);
 }
 
 
@@ -1521,8 +1548,6 @@ static void *brain_thread_func(void *arg) {
     ctx->mobility_score = 0.0f;
     ctx->last_mobility_check = time(NULL);
     ctx->last_ap_count = 0;
-    ctx->home_mode_active = false;
-    ctx->home_mode_entered = 0;
 
 
     /* AUDIT FIX: Initialize EAPOL monitor for real-time handshake detection */
@@ -1692,7 +1717,7 @@ static void *brain_thread_func(void *arg) {
 
         /* Mode Bandit: Select operating mode at start of epoch */
         time_t now = time(NULL);
-        bool mode_expired = (now - ctx->mode_started) > 120;  /* 5 min per mode */
+        bool mode_expired = (now - ctx->mode_started) > 300;  /* 5 min per mode */
         
         if (mode_expired || ctx->mode_handshakes >= 3) {
             /* Observe outcome for previous mode */
@@ -1762,7 +1787,7 @@ static void *brain_thread_func(void *arg) {
                     /* Reset blind counter since we just recovered */
                     ctx->epoch.blind_for = 0;
                     /* Give bettercap time to restart scanning */
-                    sleep(10);
+                    sleep(5); update_mobility(ctx); sleep(5);
                     continue;
                 }
             }
@@ -1805,9 +1830,15 @@ static void *brain_thread_func(void *arg) {
                 }
             }
 
-            usleep(ctx->config.recon_time * 1000000);
-            /* Mobility check during blind mode idle */
-            update_mobility(ctx);
+            /* Sleep recon_time but check mobility every 5s */
+            {
+                int _blind_sleep_s = ctx->config.recon_time;
+                for (int _i = 0; _i < _blind_sleep_s && ctx->running; _i += 5) {
+                    int _chunk = (_blind_sleep_s - _i) < 5 ? (_blind_sleep_s - _i) : 5;
+                    sleep(_chunk);
+                    update_mobility(ctx);
+                }
+            }
             continue;
         }
         
@@ -1816,72 +1847,13 @@ static void *brain_thread_func(void *arg) {
         /* Sprint 4 #9: Update mobility score */
         update_mobility(ctx);
 
-        /* Sprint 4 #12: Home mode detection */
-        if (check_home_network(ctx)) {
-            enter_home_mode(ctx);
-            /* In home mode: skip attacks, idle and run cracking */
-            if (ctx->home_mode_active) {
-                /* Sprint 8: Hash sync when on home network */
-                if (hash_sync_is_due() && hash_sync_has_internet()) {
-                    fprintf(stderr, "[brain] [home] Internet available - running hash sync\n");
-                    /* AUDIT FIX: Set MOOD_SYNCING during sync */
-                    brain_set_mood(ctx, MOOD_SYNCING);
-                    hash_sync_result_t _hsync;
-                    hash_sync_run(&_hsync);
-                    if (_hsync.success) {
-                        fprintf(stderr, "[brain] [home] sync OK: pushed=%d imported=%d\n",
-                            _hsync.hashes_pushed, _hsync.passwords_imported);
-                    }
-                    ap_db_export_json(NULL);
-                }
-                fprintf(stderr, "[brain] [home] skipping attacks (home mode)\n");
-                if (ctx->crack_mgr && ctx->crack_mgr->state != CRACK_RUNNING &&
-                    !crack_mgr_exhausted(ctx->crack_mgr)) {
-                    crack_mgr_start(ctx->crack_mgr);
-                }
-                /* Sleep 30s in 2s chunks so mobility stays responsive */
-                for (int _hs = 0; _hs < 15 && ctx->running; _hs++) {
-                    sleep(2);
-                    update_mobility(ctx);
-                }
-                brain_epoch_next(ctx);
-                brain_update_mood(ctx);
-                continue;  /* Skip to next epoch */
-            }
-        } else {
-            exit_home_mode(ctx);
-        }
-
-
-        /* Sprint 8: 2nd Home (hotspot) detection */
-        if (!ctx->home_mode_active && check_home2_network(ctx)) {
-            enter_home2_mode(ctx);
-            if (ctx->home2_mode_active) {
-                if (hash_sync_is_due() && hash_sync_has_internet()) {
-                    fprintf(stderr, "[brain] [home2] Internet available - running hash sync\n");
-                    hash_sync_result_t sync_res;
-                    hash_sync_run(&sync_res);
-                    if (sync_res.success) {
-                        fprintf(stderr, "[brain] [home2] sync OK: pushed=%d imported=%d\n",
-                            sync_res.hashes_pushed, sync_res.passwords_imported);
-                    }
-                    ap_db_export_json(NULL);
-                }
-                /* Sleep 30s in 2s chunks so mobility stays responsive */
-                for (int _h2s = 0; _h2s < 15 && ctx->running; _h2s++) {
-                    sleep(2);
-                    update_mobility(ctx);
-                }
-                continue;
-            }
-        } else if (!check_home2_network(ctx)) {
-            exit_home2_mode(ctx);
-        }
+        /* Home mode REMOVED — skip-after-capture handles idle automatically.
+         * Hash sync runs during sync_window mode. Crack manager runs when bored. */
 
         /* Sprint 6 #17: Geo-fence check */
         if (!geo_fence_check(ctx)) {
             fprintf(stderr, "[brain] [geo-fence] outside fence -- skipping attacks\n");
-            sleep(10);
+            sleep(5); update_mobility(ctx); sleep(5);
             brain_epoch_next(ctx);
             brain_update_mood(ctx);
             continue;
@@ -1960,61 +1932,58 @@ static void *brain_thread_func(void *arg) {
         /* Use Thompson-based channel selection instead of static sorting */
         int selected_ch = cb_select_channel(&ctx->channel_bandit, channels, num_channels, ap_counts_per_channel);
         
-        /* Reorder channels so selected one is first, then others by Thompson sampling */
+        /* Reorder channels: selected channel first, rest sorted by Thompson score.
+         * O(n log n) via qsort instead of O(n³) repeated selection. */
         if (selected_ch > 0 && num_channels > 1) {
-            /* Build a new order: selected channel first */
-            int ordered_channels[BRAIN_MAX_CHANNELS];
-            int ordered_ap_counts[BRAIN_MAX_CHANNELS];
-            int ordered_idx = 0;
-            
-            /* First: the Thompson-selected channel */
+            /* Sample Thompson scores for all channels in one pass */
+            typedef struct { int channel; int ap_count; float score; } ch_score_t;
+            ch_score_t ch_scores[BRAIN_MAX_CHANNELS];
+            time_t _now = time(NULL);
+            int score_count = 0;
+            int selected_idx = -1;
+
             for (int i = 0; i < num_channels; i++) {
-                if (channels[i] == selected_ch) {
-                    ordered_channels[ordered_idx] = channels[i];
-                    ordered_ap_counts[ordered_idx] = ap_counts_per_channel[i];
-                    ordered_idx++;
-                    break;
+                int ch = channels[i];
+                if (ch == selected_ch) { selected_idx = i; continue; }
+                cb_channel_t *c = &ctx->channel_bandit.channels[ch];
+                float prob = ts_beta_sample(c->alpha, c->beta);
+                float explore = 0.0f;
+                if (c->last_visited > 0) {
+                    float hrs = (float)(_now - c->last_visited) / 3600.0f;
+                    explore = ctx->channel_bandit.exploration_bonus * fminf(hrs, 2.0f) / 2.0f;
+                } else {
+                    explore = ctx->channel_bandit.exploration_bonus;
                 }
+                ch_scores[score_count].channel = ch;
+                ch_scores[score_count].ap_count = ap_counts_per_channel[i];
+                ch_scores[score_count].score = (prob + explore) * (1.0f + 0.1f * (float)ap_counts_per_channel[i]);
+                score_count++;
             }
-            
-            /* Then: remaining channels in Thompson-sampled order */
-            for (int pass = 0; pass < num_channels - 1 && ordered_idx < num_channels; pass++) {
-                int remaining_channels[BRAIN_MAX_CHANNELS];
-                int remaining_counts[BRAIN_MAX_CHANNELS];
-                int remaining_count = 0;
-                
-                for (int i = 0; i < num_channels; i++) {
-                    bool already_added = false;
-                    for (int j = 0; j < ordered_idx; j++) {
-                        if (channels[i] == ordered_channels[j]) {
-                            already_added = true;
-                            break;
-                        }
-                    }
-                    if (!already_added) {
-                        remaining_channels[remaining_count] = channels[i];
-                        remaining_counts[remaining_count] = ap_counts_per_channel[i];
-                        remaining_count++;
-                    }
-                }
-                
-                if (remaining_count > 0) {
-                    int next_ch = cb_select_channel(&ctx->channel_bandit, remaining_channels, remaining_count, remaining_counts);
-                    for (int i = 0; i < remaining_count; i++) {
-                        if (remaining_channels[i] == next_ch) {
-                            ordered_channels[ordered_idx] = remaining_channels[i];
-                            ordered_ap_counts[ordered_idx] = remaining_counts[i];
-                            ordered_idx++;
-                            break;
-                        }
+
+            /* Sort remaining channels by score descending */
+            for (int a = 0; a < score_count - 1; a++) {
+                for (int b = a + 1; b < score_count; b++) {
+                    if (ch_scores[b].score > ch_scores[a].score) {
+                        ch_score_t tmp = ch_scores[a];
+                        ch_scores[a] = ch_scores[b];
+                        ch_scores[b] = tmp;
                     }
                 }
             }
-            
-            /* Copy back */
-            for (int i = 0; i < ordered_idx; i++) {
-                channels[i] = ordered_channels[i];
-                channel_counts[channels[i]] = ordered_ap_counts[i];
+
+            /* Rebuild: selected first, then sorted rest */
+            int ordered_idx = 0;
+            if (selected_idx >= 0) {
+                int tmp_ch = channels[selected_idx];
+                int tmp_cnt = ap_counts_per_channel[selected_idx];
+                channels[0] = tmp_ch;
+                channel_counts[tmp_ch] = tmp_cnt;
+                ordered_idx = 1;
+            }
+            for (int i = 0; i < score_count && ordered_idx < num_channels; i++) {
+                channels[ordered_idx] = ch_scores[i].channel;
+                channel_counts[ch_scores[i].channel] = ch_scores[i].ap_count;
+                ordered_idx++;
             }
             num_channels = ordered_idx;
         }
@@ -2182,12 +2151,8 @@ static void *brain_thread_func(void *arg) {
                 if (bcap_get_ap(ctx->bcap, i, &ap) != 0) continue;
                 if (ap.channel != ch) continue;
 
-                /* Hardcoded whitelist REMOVED — use config.toml whitelist via stealth system */
-                
-                /* Skip whitelisted APs (home/office networks) */
-                if (ctx->stealth && stealth_is_whitelisted(ctx->stealth, ap.ssid)) {
-                    continue;
-                }
+                /* Whitelist: attack until captured, then skip via 3-layer check below.
+                 * Stealth whitelist now stores PSK for future auto-connect only. */
 
                 /* Skip WIDS/honeypot APs */
                 if (ctx->stealth && stealth_is_wids_ap(ctx->stealth, ap.ssid)) {
@@ -2197,14 +2162,62 @@ static void *brain_thread_func(void *arg) {
 
                 /* Filter weak signals */
                 /* Sprint 8: Upsert AP into persistent database */
+                char _bssid_str[18];
                 {
-                    char _bssid_str[18];
                     mac_to_str(&ap.bssid, _bssid_str);
+                    /* FIX: Only write GPS when has_fix is true.
+                     * Previously, stale lat/lon from a timed-out GPS session
+                     * would overwrite the DB with wherever we WERE, not where
+                     * we ARE. This caused map markers to not update properly
+                     * on subsequent walks past the same APs. */
                     double _lat = 0.0, _lon = 0.0;
-                    if (ctx->gps) { _lat = ctx->gps->latitude; _lon = ctx->gps->longitude; }
+                    if (ctx->gps && ctx->gps->has_fix &&
+                        (ctx->gps->latitude != 0.0 || ctx->gps->longitude != 0.0)) {
+                        _lat = ctx->gps->latitude;
+                        _lon = ctx->gps->longitude;
+                    }
                     ap_db_upsert(_bssid_str, ap.ssid, ap.encryption, ap.vendor,
                                 ap.channel, ap.rssi, _lat, _lon);
                     ctx->ap_db_upsert_count++;
+                }
+
+                /* Build BSSID string for handshake lookups (needed before
+                 * weak-AP filter so GPS refinement can run on all seen APs) */
+                char _hs_mac[18];
+                snprintf(_hs_mac, sizeof(_hs_mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                    ap.bssid.addr[0], ap.bssid.addr[1], ap.bssid.addr[2],
+                    ap.bssid.addr[3], ap.bssid.addr[4], ap.bssid.addr[5]);
+                hs_quality_t _hs_q = get_handshake_quality(_hs_mac);
+
+                /* GPS refinement: update stored GPS if we are closer now.
+                 * MUST run BEFORE the weak-AP filter! Even weak APs (-76 to -90 dBm)
+                 * are valuable for GPS refinement when we already have a handshake.
+                 * The RSSI gating inside gps_refine_check handles whether the signal
+                 * is strong enough to improve position accuracy. */
+                if (_hs_q != HS_QUALITY_NONE && ctx->gps &&
+                    (ctx->gps->has_fix ||
+                     (ctx->gps->latitude != 0.0 && ctx->gps->longitude != 0.0))) {
+                    const char *_pcap = get_hs_pcap_path(_hs_mac);
+                    if (_pcap) {
+                        gps_refine_check(_hs_mac, ap.rssi, ctx->gps, _pcap);
+                    } else {
+                        /* Debug: pcap path not in cache — could be format mismatch */
+                        static int _pcap_miss_count = 0;
+                        if (++_pcap_miss_count <= 5) {
+                            fprintf(stderr, "[gps-refine] SKIP %s: no pcap_path in cache (hs_q=%d)\n",
+                                    _hs_mac, (int)_hs_q);
+                        }
+                    }
+                } else if (_hs_q != HS_QUALITY_NONE) {
+                    /* Debug: has handshake but no GPS context */
+                    static int _gps_miss_count = 0;
+                    if (++_gps_miss_count <= 3) {
+                        fprintf(stderr, "[gps-refine] SKIP %s: no GPS (gps=%p has_fix=%d lat=%.4f lon=%.4f)\n",
+                                _hs_mac, (void*)ctx->gps,
+                                ctx->gps ? ctx->gps->has_fix : -1,
+                                ctx->gps ? ctx->gps->latitude : 0.0,
+                                ctx->gps ? ctx->gps->longitude : 0.0);
+                    }
                 }
 
                 if (ctx->config.filter_weak && ap.rssi < ctx->config.min_rssi) {
@@ -2212,23 +2225,11 @@ static void *brain_thread_func(void *arg) {
                             ap.ssid, ap.rssi, ctx->config.min_rssi);
                     continue;
                 }
-                
-                /* Skip APs with FULL handshakes (save cycles, attack new targets) */
-                char _hs_mac[18];
-                snprintf(_hs_mac, sizeof(_hs_mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                    ap.bssid.addr[0], ap.bssid.addr[1], ap.bssid.addr[2],
-                    ap.bssid.addr[3], ap.bssid.addr[4], ap.bssid.addr[5]);
-                hs_quality_t _hs_q = get_handshake_quality(_hs_mac);
+                /* Check if this AP is an orphan needing rescan (reconciliation-inserted) */
+                bool _needs_rescan = ap_db_needs_rescan(_bssid_str);
 
-                /* GPS refinement: update stored GPS if we are closer now */
-                if (_hs_q != HS_QUALITY_NONE && ctx->gps && ctx->gps->has_fix) {
-                    const char *_pcap = get_hs_pcap_path(_hs_mac);
-                    if (_pcap) {
-                        gps_refine_check(_hs_mac, ap.rssi, ctx->gps, _pcap);
-                    }
-                }
-                if (_hs_q == HS_QUALITY_FULL) {
-                    /* Already have crackable handshake, skip entirely */
+                if (_hs_q == HS_QUALITY_FULL && !_needs_rescan) {
+                    /* Already have crackable handshake and not orphan — skip entirely */
                     continue;
                 }
                 /* AUDIT FIX: Skip APs with live EAPOL captures detected */
@@ -2360,9 +2361,20 @@ static void *brain_thread_func(void *arg) {
                         drv_add_breadcrumb(&ctx->driving, mac_str, ap.ssid,
                                           (int8_t)ap.rssi, ap.channel,
                                           _blat, _blon, false);
-                        /* Use driving mode's association filter (skip weak, already-captured, etc.) */
+
+                        /* Orphan APs (from reconciliation): massive priority boost.
+                         * These are APs we have handshakes for but never scanned —
+                         * we need bettercap to see them so the DB gets populated
+                         * with encryption, vendor, channel, clients, GPS refinement. */
+                        if (_needs_rescan && entity) {
+                            entity->client_boost += 5.0f;
+                            fprintf(stderr, "[brain] [drv-rescan] %s needs rescan — boosted\n", ap.ssid);
+                        }
+
+                        /* Use driving mode's association filter (skip weak, already-captured, etc.)
+                         * But exempt orphan/rescan APs — they must be processed */
                         bool _pmkid_avail = (_hs_q == HS_QUALITY_PMKID);
-                        if (!drv_should_associate(&ctx->driving, ap.channel,
+                        if (!_needs_rescan && !drv_should_associate(&ctx->driving, ap.channel,
                                                  (int8_t)ap.rssi, (_hs_q == HS_QUALITY_FULL),
                                                  _pmkid_avail)) {
                             /* Driving filter rejected — skip this AP as candidate */
@@ -2397,6 +2409,16 @@ static void *brain_thread_func(void *arg) {
                     } else {
                         entity->client_boost = _has_hs ? 0.15f : 0.5f;
                     }
+
+                    /* Orphan AP boost (all modes): APs from reconciliation that
+                     * have never been live-scanned get priority so bettercap can
+                     * fill in encryption, vendor, channel, client data, and GPS. */
+                    if (_needs_rescan) {
+                        entity->client_boost += 3.0f;
+                        if (ctx->mobility_ctx.current_mode != MOBILITY_DRIVING) {
+                            fprintf(stderr, "[brain] [rescan] %s needs rescan — boosted\n", ap.ssid);
+                        }
+                    }
                     
                     /* Store RSSI for sorting */
                     entity->last_rssi = ap.rssi;
@@ -2404,15 +2426,9 @@ static void *brain_thread_func(void *arg) {
                 }
             }
 
-            /* Sort candidates by signal strength (strongest first) */
-            for (int a = 0; a < candidate_count - 1; a++) {
-                for (int b = a + 1; b < candidate_count; b++) {
-                    if (candidates[b]->last_rssi > candidates[a]->last_rssi) {
-                        ts_entity_t *tmp = candidates[a];
-                        candidates[a] = candidates[b];
-                        candidates[b] = tmp;
-                    }
-                }
+            /* Sort candidates by signal strength (strongest first) — O(n log n) */
+            if (candidate_count > 1) {
+                qsort(candidates, candidate_count, sizeof(ts_entity_t *), cmp_candidate_rssi);
             }
 
             /* Cap to top 3 candidates per channel - don't waste CPU on weak APs */
@@ -2450,7 +2466,11 @@ static void *brain_thread_func(void *arg) {
                                 ctx->on_attack_phase(9, ctx->callback_user_data);
                         }
                     }
-                    sleep(30);  /* 30s idle instead of rapid cycling */
+                    /* Sleep 30s but check mobility every 5s */
+                    for (int _i = 0; _i < 6 && ctx->running; _i++) {
+                        sleep(5);
+                        update_mobility(ctx);
+                    }
                     goto epoch_end;
                 }
             } else {
@@ -2497,10 +2517,36 @@ static void *brain_thread_func(void *arg) {
             uint64_t _t_atk = cpu_act_start();
             for (int ci = 0; ci < candidate_count && ctx->running; ci++) {
                 uint64_t _t_ts = cpu_act_start();
-                ts_entity_t *target = (ci == 0) ?
-                    ts_decide_entity(ctx->thompson, candidates, candidate_count,
-                                     &TS_ACTION_ASSOCIATE) :
-                    candidates[ci];
+                ts_entity_t *target;
+                if (ci == 0) {
+                    /* T209: Use v3 combined scoring if available, else basic Thompson */
+                    if (ctx->v3 && candidate_count > 0) {
+                        /* Score all candidates with v3, pick the best */
+                        float best_v3 = -1.0f;
+                        target = candidates[0];
+                        double _lat_v3 = 0.0, _lon_v3 = 0.0;
+                        if (ctx->gps && ctx->gps->has_fix) {
+                            _lat_v3 = ctx->gps->latitude;
+                            _lon_v3 = ctx->gps->longitude;
+                        }
+                        for (int vi = 0; vi < candidate_count; vi++) {
+                            int eidx = (int)(candidates[vi] - ctx->thompson->entities);
+                            float sc = v3_score_entity(ctx->v3, ctx->thompson,
+                                                       candidates[vi], eidx,
+                                                       &TS_ACTION_ASSOCIATE,
+                                                       _lat_v3, _lon_v3);
+                            if (sc > best_v3) {
+                                best_v3 = sc;
+                                target = candidates[vi];
+                            }
+                        }
+                    } else {
+                        target = ts_decide_entity(ctx->thompson, candidates, candidate_count,
+                                                  &TS_ACTION_ASSOCIATE);
+                    }
+                } else {
+                    target = candidates[ci];
+                }
                 cpu_act_end(g_health_state, CPU_ACT_THOMPSON, _t_ts);
                 if (!target) continue;
                 if (ci > 0 && candidates[0] == target) continue;
@@ -2646,6 +2692,12 @@ static void *brain_thread_func(void *arg) {
                     if (ctx->current_mode == MODE_PASSIVE_DISCOVERY) {
                         /* Passive mode: observe only, give small Thompson reward */
                         ts_observe_outcome(target, false, priority * 0.05f);
+                        /* v3.0: Passive observation still sees the beacon */
+                        if (ctx->v3) {
+                            int eidx = (int)(target - ctx->thompson->entities);
+                            v3_observe(ctx->v3, ctx->thompson, target, eidx,
+                                       REWARD_BEACON, ctx->last_lat, ctx->last_lon);
+                        }
                         break;
                     }
 
@@ -2850,6 +2902,27 @@ static void *brain_thread_func(void *arg) {
                     }
                     }
 
+                    /* v3.0: Feed attack outcome to all v3 subsystems.
+                     * The EAPOL callback handles HANDSHAKE/VERIFIED rewards.
+                     * Here we record the intermediate signals:
+                     *   - AP seen on channel → BEACON
+                     *   - Clients detected → CLIENTS
+                     *   - Deauth sent (pre-capture) → CLIENTS (we know there are clients)
+                     *   - Association only → BEACON (AP responded) */
+                    if (ctx->v3) {
+                        int eidx = (int)(target - ctx->thompson->entities);
+                        v3_reward_level_t rlvl;
+                        if (did_deauth_this_ch > 0 || ap.clients_count > 0) {
+                            rlvl = REWARD_CLIENTS;
+                        } else if (did_assoc_this_ch > 0) {
+                            rlvl = REWARD_BEACON;
+                        } else {
+                            rlvl = REWARD_BEACON;  /* At minimum we saw the AP */
+                        }
+                        v3_observe(ctx->v3, ctx->thompson, target, eidx,
+                                   rlvl, ctx->last_lat, ctx->last_lon);
+                    }
+
                     /* AngryOxide insight: ALWAYS try PMKID (m1_retrieval)
                      * on unapproached APs regardless of attack phase.
                      * This dramatically improves PMKID collection rate. */
@@ -2923,16 +2996,89 @@ static void *brain_thread_func(void *arg) {
                 usleep(100000);  /* 100ms firmware breathing room */
             }
 
-            /* Smart dwell: yield-aware listen time from channel_map (Phase 1D) */
-            if (did_deauth_this_ch > 0 || did_assoc_this_ch > 0) {
+            /* FIX: Attack Dwell — hold channel after deauth to capture handshake.
+             *
+             * ROOT CAUSE of poor handshake capture: after sending deauth frames,
+             * we'd hop to the next channel within 200-500ms. But clients take
+             * 1-5 seconds to reconnect. By the time the 4-way handshake starts,
+             * we're already on a different channel and miss it entirely.
+             *
+             * Solution: After deauth/disassoc attacks, dwell on the channel for
+             * 3-8 seconds (RSSI-proportional — stronger signal = longer dwell
+             * because we're closer and more likely to capture the reconnect).
+             * During the dwell, send a second burst of deauths at the midpoint
+             * to catch clients that didn't disconnect on the first attempt.
+             *
+             * For PMKID-only attacks (no deauth), use shorter dwell since we're
+             * just waiting for M1 response, not a full client reconnection cycle.
+             *
+             * This is the single biggest improvement for handshake capture rate. */
+            if (did_deauth_this_ch > 0) {
+                /* Deauth attack: need to wait for client reconnection
+                 * Strong signal = closer = higher chance = longer dwell */
+                int best_rssi_on_ch = -100;
+                for (int ci2 = 0; ci2 < candidate_count; ci2++) {
+                    if (candidates[ci2]->last_rssi > best_rssi_on_ch)
+                        best_rssi_on_ch = candidates[ci2]->last_rssi;
+                }
+                /* Scale dwell: -30dBm → 8s, -60dBm → 5s, -80dBm → 3s */
+                int attack_dwell_ms;
+                if (best_rssi_on_ch >= -50) {
+                    attack_dwell_ms = 8000;
+                } else if (best_rssi_on_ch >= -65) {
+                    attack_dwell_ms = 6000;
+                } else if (best_rssi_on_ch >= -75) {
+                    attack_dwell_ms = 4000;
+                } else {
+                    attack_dwell_ms = 3000;
+                }
+
+                /* Phase 2B: Driving mode uses shorter dwell (moving fast) */
+                if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING &&
+                    ctx->driving.active && drv_dwell_ms > 0) {
+                    attack_dwell_ms = drv_dwell_ms;  /* Driving override */
+                }
+
+                fprintf(stderr, "[brain] [attack-dwell] ch%d: holding %dms for handshake (rssi=%d, deauths=%d)\n",
+                        ch, attack_dwell_ms, best_rssi_on_ch, did_deauth_this_ch);
+
+                /* Wait first half, then send a second deauth burst */
+                usleep((attack_dwell_ms / 2) * 1000);
+
+                /* Second deauth burst at midpoint — catches clients that
+                 * didn't disconnect on the first attempt */
+                if (g_raw_sock >= 0 && candidate_count > 0) {
+                    for (int ci2 = 0; ci2 < candidate_count && ci2 < 2; ci2++) {
+                        ts_entity_t *retarget = candidates[ci2];
+                        for (int i = 0; i < ap_count; i++) {
+                            bcap_ap_t ap2;
+                            if (bcap_get_ap(ctx->bcap, i, &ap2) != 0) continue;
+                            char mac2[BRAIN_MAC_STR_LEN];
+                            mac_to_str(&ap2.bssid, mac2);
+                            if (strcasecmp(mac2, retarget->entity_id) != 0) continue;
+                            if (ap2.channel != ch) continue;
+                            /* Broadcast deauth (second burst) */
+                            attack_deauth_broadcast(g_raw_sock, &ap2);
+                            break;
+                        }
+                    }
+                    fprintf(stderr, "[brain] [attack-dwell] ch%d: second deauth burst sent\n", ch);
+                }
+
+                /* Wait remaining half for handshake capture */
+                usleep((attack_dwell_ms - attack_dwell_ms / 2) * 1000);
+            } else if (did_assoc_this_ch > 0) {
+                /* PMKID-only: shorter dwell, just waiting for M1 response */
                 int dwell_ms = channel_map_get_listen_ms(&ctx->channel_map, ch);
                 if (dwell_ms <= 0) dwell_ms = ctx->config.hop_recon_time * 1000;
-                /* Phase 2B: Driving mode uses fast 50ms dwell, not yield-based */
+                /* Minimum 2s for PMKID — AP needs time to send M1 */
+                if (dwell_ms < 2000) dwell_ms = 2000;
+                /* Phase 2B: Driving mode override */
                 if (ctx->mobility_ctx.current_mode == MOBILITY_DRIVING &&
                     ctx->driving.active && drv_dwell_ms > 0) {
                     dwell_ms = drv_dwell_ms;
                 }
-                fprintf(stderr, "[brain] waiting %dms before hop to ch %d (yield-dwell)\n",
+                fprintf(stderr, "[brain] waiting %dms before hop to ch %d (pmkid-dwell)\n",
                         dwell_ms, (c + 1 < num_channels) ?
                         channels[c + 1] : channels[0]);
                 usleep(dwell_ms * 1000);
@@ -3266,6 +3412,7 @@ brain_ctx_t *brain_create(const brain_config_t *config, bcap_ws_ctx_t *bcap) {
     ctx->tx_power_current = config->tx_power_max;
     ctx->geo_fence_active = !config->geo_fence_enabled;  /* Start as inside if fence disabled */
     ctx->last_mac_rotation = time(NULL);
+    ctx->mobility_boot_skips = 1;  /* Skip first check (2s at 2s interval) */
     
     /* Copy channels array if provided */
     if (config->channels && config->num_channels > 0) {
@@ -3291,7 +3438,24 @@ brain_ctx_t *brain_create(const brain_config_t *config, bcap_ws_ctx_t *bcap) {
     
     /* Try to load saved state */
     ts_load_state(ctx->thompson, "/etc/pwnagotchi/brain_state.bin");
-    
+
+    /* Initialize v3.0 Brain Extension (LinUCB, Windowed Thompson, etc.) */
+    ctx->v3 = v3_brain_create();
+    if (ctx->v3) {
+        if (v3_load_state(ctx->v3, "/var/lib/pwnagotchi/v3_brain.bin") == 0) {
+            fprintf(stderr, "[brain] v3.0 brain state loaded\n");
+        } else {
+            fprintf(stderr, "[brain] v3.0 brain initialized (no saved state)\n");
+        }
+        /* Try to import PC distillation if available */
+        if (v3_distillation_import(ctx->v3, ctx->thompson,
+                                   "/tmp/pc_distillation_v3.json") == 0) {
+            fprintf(stderr, "[brain] v3.0 PC distillation imported\n");
+        }
+    } else {
+        fprintf(stderr, "[brain] WARNING: v3.0 brain creation failed\n");
+    }
+
     /* Initialize channel bandit (Thompson-based channel selection) */
     cb_init(&ctx->channel_bandit);
 
@@ -3336,6 +3500,8 @@ brain_ctx_t *brain_create(const brain_config_t *config, bcap_ws_ctx_t *bcap) {
     /* Sprint 8: Initialize AP Database */
     if (ap_db_init(NULL) == 0) {
         fprintf(stderr, "[brain] AP database initialized\n");
+        /* Reconcile DB with files on disk (handshakes + cracked passwords) */
+        ap_db_reconcile_files();
     }
 
     /* Sprint 8: Initialize hash sync */
@@ -3424,7 +3590,19 @@ void brain_destroy(brain_ctx_t *ctx) {
         ts_save_state(ctx->thompson, "/etc/pwnagotchi/brain_state.bin");
         ts_brain_destroy(ctx->thompson);
     }
-    
+
+    /* Save and destroy v3.0 brain */
+    if (ctx->v3) {
+        v3_save_state(ctx->v3, "/var/lib/pwnagotchi/v3_brain.bin");
+        /* Export JSON for PC sync on shutdown */
+        if (ctx->thompson) {
+            v3_state_export_json(ctx->v3, ctx->thompson,
+                                 "/var/lib/pwnagotchi/v3_export.json");
+        }
+        v3_brain_destroy(ctx->v3);
+        ctx->v3 = NULL;
+    }
+
     /* Sprint 8: Close AP database */
     ap_db_close();
 

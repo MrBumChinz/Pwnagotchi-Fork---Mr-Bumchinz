@@ -136,6 +136,9 @@ struct bcap_ws_ctx {
 
     /* Freeze/thaw: pause service thread during bettercap SIGSTOP */
     volatile bool frozen;
+
+    /* Cached /dev/urandom fd — opened once, used for WS key + frame masks */
+    int urandom_fd;
 };
 
 /* State name helper for logging */
@@ -241,15 +244,12 @@ static void base64_encode(const unsigned char *in, size_t len, char *out) {
     out[j] = '\0';
 }
 
-/* Generate random WebSocket key */
-static void generate_ws_key(char *key_out) {
+/* Generate random WebSocket key using cached urandom fd */
+static void generate_ws_key(char *key_out, int urandom_fd) {
     unsigned char raw[16];
     
-    /* Use /dev/urandom for randomness */
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) {
-        read(fd, raw, 16);
-        close(fd);
+    if (urandom_fd >= 0) {
+        read(urandom_fd, raw, 16);
     } else {
         /* Fallback to time-based */
         srand(time(NULL) ^ getpid());
@@ -356,16 +356,14 @@ static int socket_connect(const char *host, int port, int timeout_ms) {
  * ========================================================================== */
 
 /* Send a WebSocket frame */
-static int ws_send_frame(int sock, uint8_t opcode, const void *data, size_t len) {
+static int ws_send_frame(int sock, uint8_t opcode, const void *data, size_t len, int urandom_fd) {
     uint8_t header[14];
     size_t header_len = 2;
     uint8_t mask[4];
     
-    /* Generate mask */
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) {
-        read(fd, mask, 4);
-        close(fd);
+    /* Generate mask from cached urandom fd */
+    if (urandom_fd >= 0) {
+        read(urandom_fd, mask, 4);
     } else {
         for (int i = 0; i < 4; i++) mask[i] = rand() & 0xFF;
     }
@@ -419,23 +417,23 @@ static int ws_send_frame(int sock, uint8_t opcode, const void *data, size_t len)
 }
 
 /* Send text message */
-static int ws_send_text(int sock, const char *text) {
-    return ws_send_frame(sock, WS_OPCODE_TEXT, text, strlen(text));
+static int ws_send_text(bcap_ws_ctx_t *ctx, const char *text) {
+    return ws_send_frame(ctx->sock_fd, WS_OPCODE_TEXT, text, strlen(text), ctx->urandom_fd);
 }
 
 /* Send ping */
-static int ws_send_ping(int sock) {
-    return ws_send_frame(sock, WS_OPCODE_PING, NULL, 0);
+static int ws_send_ping(bcap_ws_ctx_t *ctx) {
+    return ws_send_frame(ctx->sock_fd, WS_OPCODE_PING, NULL, 0, ctx->urandom_fd);
 }
 
 /* Send pong */
-static int ws_send_pong(int sock, const void *data, size_t len) {
-    return ws_send_frame(sock, WS_OPCODE_PONG, data, len);
+static int ws_send_pong(bcap_ws_ctx_t *ctx, const void *data, size_t len) {
+    return ws_send_frame(ctx->sock_fd, WS_OPCODE_PONG, data, len, ctx->urandom_fd);
 }
 
 /* Send close */
-static int ws_send_close(int sock) {
-    return ws_send_frame(sock, WS_OPCODE_CLOSE, NULL, 0);
+static int ws_send_close(bcap_ws_ctx_t *ctx) {
+    return ws_send_frame(ctx->sock_fd, WS_OPCODE_CLOSE, NULL, 0, ctx->urandom_fd);
 }
 
 /* ==========================================================================
@@ -447,7 +445,7 @@ static int ws_handshake(bcap_ws_ctx_t *ctx) {
     char request[1024];
     char response[2048];
     
-    generate_ws_key(ws_key);
+    generate_ws_key(ws_key, ctx->urandom_fd);
     
     /* Build HTTP upgrade request */
     /* Note: bettercap uses basic auth */
@@ -818,6 +816,11 @@ static int ws_recv_frame(bcap_ws_ctx_t *ctx) {
     
     /* Receive payload */
     if (payload_len > 0) {
+        /* T355: Hard limit on frame size to prevent memory exhaustion */
+        if (payload_len > 65536) {
+            fprintf(stderr, "[bcap_ws] T355: frame too large (%zu bytes), rejecting\n", payload_len);
+            return -1;
+        }
         if (payload_len > ctx->frame_capacity) {
             /* Expand buffer */
             size_t new_cap = payload_len + 1024;
@@ -851,7 +854,7 @@ static int ws_recv_frame(bcap_ws_ctx_t *ctx) {
     /* Handle control frames */
     switch (opcode) {
         case WS_OPCODE_PING:
-            ws_send_pong(ctx->sock_fd, ctx->frame_buffer, ctx->frame_len);
+            ws_send_pong(ctx, ctx->frame_buffer, ctx->frame_len);
             return 0;
             
         case WS_OPCODE_PONG:
@@ -990,7 +993,7 @@ static void* service_thread_func(void *arg) {
             /* Heartbeat check */
             time_t now = time(NULL);
             if (now - ctx->last_ping_sent > (ctx->config.heartbeat_interval_ms / 1000)) {
-                ws_send_ping(ctx->sock_fd);
+                ws_send_ping(ctx);
                 ctx->last_ping_sent = now;
                 ctx->awaiting_pong = true;
             }
@@ -1070,7 +1073,13 @@ bcap_ws_ctx_t* bcap_create(const bcap_config_t *config) {
     /* Sync timer: force immediate first sync */
     ctx->last_full_sync = 0;
     ctx->initial_sync_done = false;
-    
+
+    /* Cache /dev/urandom fd for WS key generation + frame masking */
+    ctx->urandom_fd = open("/dev/urandom", O_RDONLY);
+    if (ctx->urandom_fd < 0) {
+        fprintf(stderr, "[bcap_ws] WARNING: /dev/urandom open failed, using time-based fallback\n");
+    }
+
     return ctx;
 }
 
@@ -1078,6 +1087,12 @@ void bcap_destroy(bcap_ws_ctx_t *ctx) {
     if (!ctx) return;
     
     bcap_disconnect(ctx);
+    
+    /* Close cached urandom fd */
+    if (ctx->urandom_fd >= 0) {
+        close(ctx->urandom_fd);
+        ctx->urandom_fd = -1;
+    }
     
     pthread_mutex_destroy(&ctx->state_lock);
     pthread_mutex_destroy(&ctx->data_lock);
@@ -1169,7 +1184,7 @@ void bcap_disconnect(bcap_ws_ctx_t *ctx) {
     }
     
     if (ctx->sock_fd >= 0) {
-        ws_send_close(ctx->sock_fd);
+        ws_send_close(ctx);
         close(ctx->sock_fd);
         ctx->sock_fd = -1;
     }
@@ -1272,7 +1287,7 @@ int bcap_subscribe(bcap_ws_ctx_t *ctx, const char *stream) {
              "{\"cmd\":\"events.stream\",\"args\":{\"filter\":\"%s\"}}", stream);
     
     printf("[bcap_ws] Subscribing to: %s\n", stream);
-    return ws_send_text(ctx->sock_fd, cmd);
+    return ws_send_text(ctx, cmd);
 }
 
 

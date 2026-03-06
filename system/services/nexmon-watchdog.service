@@ -1,0 +1,16 @@
+[Unit]
+Description=Nexmon Monitor Mode Watchdog
+Documentation=https://github.com/MrBumchinz/pwnhub
+After=network.target bettercap.service pwnaui.service
+Wants=bettercap.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/nexmon-watchdog.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

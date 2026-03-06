@@ -142,6 +142,15 @@ void theme_list_free(char **list);
  */
 face_bitmap_t *theme_get_face(face_state_t state);
 face_state_t theme_face_string_to_state(const char *face_str);
+const char *theme_get_face_name(face_state_t state);
+
+/*
+ * Theme enable/disable and enumeration
+ */
+void themes_set_enabled(int enabled);
+void themes_disable(void);
+int themes_count(void);
+const char **themes_list(void);
 
 /*
  * Rendering

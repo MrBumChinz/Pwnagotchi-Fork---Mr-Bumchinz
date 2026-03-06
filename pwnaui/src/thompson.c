@@ -406,8 +406,10 @@ void ts_decay_entity(ts_entity_t *entity, time_t now) {
         entity->beta = (1.0f - lambda) * entity->beta + lambda * 1.0f;
     } else if (dormant_days > TS_STALE_DAYS) {
         entity->status = ENTITY_STALE;
-        /* Gradual decay */
+        /* Gradual decay — clamp lambda to [0,1] to prevent negative alpha/beta.
+         * At day 24+ with TS_STALE_DAYS=7, unclipped lambda exceeds 1.0. */
         float lambda = 0.3f * (dormant_days / TS_STALE_DAYS);
+        if (lambda > 1.0f) lambda = 1.0f;
         entity->alpha = (1.0f - lambda) * entity->alpha + lambda * 1.0f;
         entity->beta = (1.0f - lambda) * entity->beta + lambda * 1.0f;
     }
@@ -638,28 +640,50 @@ int ts_load_state(ts_brain_t *brain, const char *path) {
     
     /* Header */
     uint32_t magic, version;
-    fread(&magic, sizeof(magic), 1, f);
-    fread(&version, sizeof(version), 1, f);
+    if (fread(&magic, sizeof(magic), 1, f) != 1 ||
+        fread(&version, sizeof(version), 1, f) != 1) {
+        pthread_mutex_unlock(&brain->lock);
+        fclose(f);
+        fprintf(stderr, "[thompson] corrupt state file (truncated header)\n");
+        return -1;
+    }
     
     if (magic != TS_STATE_MAGIC || version != TS_STATE_VERSION) {
         pthread_mutex_unlock(&brain->lock);
         fclose(f);
-        fprintf(stderr, "[thompson] invalid state file\n");
+        fprintf(stderr, "[thompson] invalid state file (magic=0x%08x version=%u)\n",
+                magic, version);
         return -1;
     }
     
     /* Brain stats */
-    fread(&brain->total_decisions, sizeof(brain->total_decisions), 1, f);
-    fread(&brain->total_handshakes, sizeof(brain->total_handshakes), 1, f);
-    fread(&brain->started_at, sizeof(brain->started_at), 1, f);
+    if (fread(&brain->total_decisions, sizeof(brain->total_decisions), 1, f) != 1 ||
+        fread(&brain->total_handshakes, sizeof(brain->total_handshakes), 1, f) != 1 ||
+        fread(&brain->started_at, sizeof(brain->started_at), 1, f) != 1) {
+        pthread_mutex_unlock(&brain->lock);
+        fclose(f);
+        fprintf(stderr, "[thompson] corrupt state file (truncated stats)\n");
+        return -1;
+    }
     
     /* Mode bandit */
-    fread(brain->mode.alpha, sizeof(brain->mode.alpha), 1, f);
-    fread(brain->mode.beta, sizeof(brain->mode.beta), 1, f);
+    if (fread(brain->mode.alpha, sizeof(brain->mode.alpha), 1, f) != 1 ||
+        fread(brain->mode.beta, sizeof(brain->mode.beta), 1, f) != 1) {
+        pthread_mutex_unlock(&brain->lock);
+        fclose(f);
+        fprintf(stderr, "[thompson] corrupt state file (truncated mode data)\n");
+        return -1;
+    }
     
     /* Entity count */
     int count;
-    fread(&count, sizeof(count), 1, f);
+    if (fread(&count, sizeof(count), 1, f) != 1 ||
+        count < 0 || count > TS_MAX_ENTITIES) {
+        pthread_mutex_unlock(&brain->lock);
+        fclose(f);
+        fprintf(stderr, "[thompson] corrupt state file (invalid entity count)\n");
+        return -1;
+    }
     
     /* Clear existing entities */
     memset(brain->entities, 0, sizeof(brain->entities));

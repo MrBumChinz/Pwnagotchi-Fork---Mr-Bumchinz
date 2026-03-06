@@ -1,0 +1,62 @@
+#!/bin/bash
+# pwnaui-hostname-sync — Sync system hostname to pwnagotchi name from config.toml
+# Run at boot (ExecStartPre) so mDNS advertises the correct name.
+# Result: http://sniffles.local/ works when name = "Sniffles" in config.toml
+
+CONFIG="/etc/pwnagotchi/config.toml"
+DEFAULT="/etc/pwnagotchi/default.toml"
+
+# Read pwnagotchi name from config (fallback to default.toml, then "pwnagotchi")
+get_pwnagotchi_name() {
+    local name=""
+    for f in "$CONFIG" "$DEFAULT"; do
+        if [ -f "$f" ]; then
+            # Match: name = "Sniffles" in [main] section (or top-level before any section)
+            name=$(awk '
+                /^\[/ { section=$0; next }
+                (section == "" || section ~ /^\[main\]/) && /^[[:space:]]*name[[:space:]]*=/ {
+                    gsub(/.*=[[:space:]]*"/, ""); gsub(/".*/, ""); print; exit
+                }
+            ' "$f")
+            [ -n "$name" ] && break
+        fi
+    done
+    # Fallback
+    echo "${name:-pwnagotchi}"
+}
+
+NAME=$(get_pwnagotchi_name)
+# Hostnames must be lowercase, alphanumeric + hyphens only
+HOSTNAME=$(echo "$NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
+
+# Sanity check
+if [ -z "$HOSTNAME" ] || [ ${#HOSTNAME} -gt 63 ]; then
+    HOSTNAME="pwnagotchi"
+fi
+
+CURRENT=$(hostname)
+
+if [ "$CURRENT" != "$HOSTNAME" ]; then
+    echo "[hostname-sync] Changing hostname: $CURRENT -> $HOSTNAME"
+    
+    # Set runtime hostname
+    hostname "$HOSTNAME"
+    
+    # Persist to /etc/hostname
+    echo "$HOSTNAME" > /etc/hostname
+    
+    # Update /etc/hosts (replace old hostname with new)
+    if grep -q "127.0.1.1" /etc/hosts; then
+        sed -i "s/127.0.1.1.*/127.0.1.1\t$HOSTNAME/" /etc/hosts
+    else
+        echo "127.0.1.1	$HOSTNAME" >> /etc/hosts
+    fi
+    
+    # Restart avahi so mDNS advertises the new name
+    if systemctl is-active --quiet avahi-daemon 2>/dev/null; then
+        systemctl restart avahi-daemon
+        echo "[hostname-sync] avahi-daemon restarted -> $HOSTNAME.local"
+    fi
+else
+    echo "[hostname-sync] Hostname already correct: $HOSTNAME"
+fi

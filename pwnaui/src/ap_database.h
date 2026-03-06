@@ -89,6 +89,15 @@ int  ap_db_get_all(ap_record_t **records, int *count);
 int  ap_db_get_unexported(ap_record_t **records, int *count);
 int  ap_db_get_stats(ap_db_stats_t *stats);
 
+/* Crack City: produce JSON for map API directly from SQL (fast path) */
+int  ap_db_crackcity_json(char **json_out);
+
+/* Startup reconciliation: sync DB with handshake/cracked files on disk */
+int  ap_db_reconcile_files(void);
+
+/* Check if AP needs rescanning (orphan inserted by reconciliation) */
+bool ap_db_needs_rescan(const char *bssid);
+
 /* Export all records as JSON (for Pi-PC sync / AI training) */
 int  ap_db_export_json(const char *output_path);
 

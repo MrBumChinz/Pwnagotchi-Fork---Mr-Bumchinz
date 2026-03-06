@@ -5,7 +5,7 @@
  * Replaces Python/PIL UI with native C for 10-30?? performance improvement.
  * 
  * Author: PwnaUI Project
- * License: MIT
+ * License: GPL-3.0-or-later
  */
 
 #define _GNU_SOURCE
@@ -20,6 +20,7 @@
 #include <sys/un.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <syslog.h>
 #include <time.h>
 #include <stdarg.h>
@@ -901,6 +902,14 @@ int main(int argc, char *argv[]) {
     
     PWNAUI_LOG_INFO("PwnaUI starting...");
     
+    /* Lower CPU priority so system services (SSH, etc.) stay responsive
+     * even if we're busy. Nice 10 = low priority, won't starve other procs */
+    if (nice(10) == -1 && errno != 0) {
+        PWNAUI_LOG_WARN("Failed to set nice value: %s", strerror(errno));
+    } else {
+        PWNAUI_LOG_INFO("Process priority lowered (nice=10)");
+    }
+    
     /* Daemonize if requested */
     if (g_daemon_mode) {
         if (daemonize() < 0) {
@@ -1047,6 +1056,52 @@ int main(int argc, char *argv[]) {
     /* Initialize UI state */
     init_ui_state();
     
+    /* Read pwnagotchi name from config.toml so display is correct */
+    {
+        char config_name[64] = {0};
+        const char *cfg_files[] = {"/etc/pwnagotchi/config.toml", "/etc/pwnagotchi/default.toml"};
+        for (int ci = 0; ci < 2 && config_name[0] == '\0'; ci++) {
+            FILE *cf = fopen(cfg_files[ci], "r");
+            if (!cf) continue;
+            char cline[512];
+            int in_main = 1;  /* Before any section = treat as [main] */
+            while (fgets(cline, sizeof(cline), cf)) {
+                if (cline[0] == '[') {
+                    in_main = (strstr(cline, "[main]") != NULL);
+                    continue;
+                }
+                if (!in_main) continue;
+                char *eq = strchr(cline, '=');
+                if (!eq) continue;
+                char key[64] = {0};
+                size_t kl = eq - cline;
+                if (kl >= sizeof(key)) continue;
+                memcpy(key, cline, kl); key[kl] = '\0';
+                char *k = key; while (*k == ' ' || *k == '\t') k++;
+                char *ke = k + strlen(k) - 1;
+                while (ke > k && (*ke == ' ' || *ke == '\t')) *ke-- = '\0';
+                if (strcmp(k, "name") != 0) continue;
+                char *q1 = strchr(eq + 1, '"');
+                if (!q1) continue;
+                char *q2 = strchr(q1 + 1, '"');
+                if (!q2) continue;
+                size_t nl = q2 - q1 - 1;
+                if (nl > 0 && nl < sizeof(config_name)) {
+                    memcpy(config_name, q1 + 1, nl);
+                    config_name[nl] = '\0';
+                }
+                break;
+            }
+            fclose(cf);
+        }
+        if (config_name[0]) {
+            char display_name[64];
+            snprintf(display_name, sizeof(display_name), "%s>", config_name);
+            strncpy(g_ui_state.name, display_name, sizeof(g_ui_state.name) - 1);
+            PWNAUI_LOG_INFO("Loaded pwnagotchi name from config: %s", config_name);
+        }
+    }
+    
     /* Initialize bettercap WebSocket client if enabled */
     if (g_bcap_enabled) {
         PWNAUI_LOG_INFO("Initializing bettercap WebSocket client");
@@ -1146,9 +1201,10 @@ int main(int argc, char *argv[]) {
             }
         }
         
-        /* Timeout for periodic tasks - keep short to drain accept queue quickly */
+        /* Timeout for periodic tasks - 50ms is plenty for e-ink display
+         * Pi Zero W single-core: 20Hz loop = ~5% CPU vs 100Hz = ~25% CPU */
         timeout.tv_sec = 0;
-        timeout.tv_usec = 10000;  /* 10ms - fast response to prevent connection pileup */
+        timeout.tv_usec = 50000;  /* 50ms - balanced responsiveness vs CPU on Pi Zero */
         
         activity = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
         

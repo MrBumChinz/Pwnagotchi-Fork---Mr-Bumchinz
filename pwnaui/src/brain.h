@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include "bcap_ws.h"
 #include "thompson.h"
+#include "thompson_v3.h"
 #include "channel_bandit.h"
 #include "stealth.h"
 #include "wifi_recovery.h"
@@ -142,15 +143,7 @@ typedef struct {
     /* Bond system (for peer support network) */
     float bond_encounters_factor;   /* Default: 100 */
 
-    /* Home mode (#12) — pause attacks when home network visible */
-    char home_ssid[64];             /* Home SSID (empty = disabled) */
-    char home_psk[128];             /* Home WPA PSK (for auto-connect) */
-    int home_min_rssi;              /* Min RSSI to trigger home mode (-60) */
-
-    /* Sprint 8: 2nd Home (hotspot for internet) */
-    char home2_ssid[64];
-    char home2_psk[128];
-    int  home2_min_rssi;
+    /* Home mode REMOVED — whitelist PSK in stealth config for future auto-connect */
 
     /* Sprint 8: GitHub hash sync config */
     hash_sync_config_t sync_config;
@@ -255,7 +248,10 @@ typedef struct {
     
     /* Thompson Sampling brain (smart entity selection) */
     ts_brain_t *thompson;
-    
+
+    /* v3.0 Brain Extension (LinUCB, Windowed Thompson, Hierarchy, etc.) */
+    v3_brain_t *v3;
+
     /* Channel bandit (smart channel selection) */
     cb_bandit_t channel_bandit;
 
@@ -330,13 +326,7 @@ typedef struct {
     volatile bool manual_mode;              /* true = manual (attacks paused) */
     time_t manual_mode_toggled;    /* When mode was last changed */
 
-    /* Home mode (#12) */
-    bool home_mode_active;          /* Currently in home mode */
-    time_t home_mode_entered;       /* When home mode was activated */
-
-    /* Sprint 8: 2nd Home (hotspot) state */
-    bool home2_mode_active;
-    time_t home2_mode_entered;
+    /* Home mode REMOVED */
 
     /* Sprint 8: Hash sync state */
     time_t last_hash_sync;
@@ -360,6 +350,14 @@ typedef struct {
     drv_ctx_t driving;                    /* Phase 2B: Driving mode pipeline */
     stat_ctx_t stationary;                /* Phase 2C: Stationary mode pipeline */
     walk_ctx_t walking;                   /* Phase 2D: Walking mode pipeline */
+
+    /* Performance: per-epoch cache for should_really_be_bored() */
+    bool bored_cache_valid;              /* Reset at each epoch boundary */
+    bool bored_cached_result;            /* Cached return value */
+
+    /* Moved from static locals for thread safety / multi-instance */
+    float smoothed_churn;                /* EMA-smoothed AP churn fraction */
+    int   mobility_boot_skips;           /* Boot grace period counter */
 } brain_ctx_t;
 
 /* ============================================================================

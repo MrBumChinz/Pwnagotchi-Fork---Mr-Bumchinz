@@ -2,7 +2,7 @@
 # Build the high-performance C UI daemon for Pwnagotchi
 
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE
+CFLAGS = -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE -MMD -MP
 LDFLAGS = -lm -lutil -lpthread -lsqlite3
 
 # Optional: libwebsockets for bettercap WebSocket client
@@ -37,6 +37,7 @@ SOURCES = $(SRCDIR)/pwnaui.c \
           $(SRCDIR)/bcap_ws.c \
           $(SRCDIR)/health_monitor.c \
           $(SRCDIR)/thompson.c \
+          $(SRCDIR)/thompson_v3.c \
           $(SRCDIR)/brain.c $(SRCDIR)/brain_attacks.c $(SRCDIR)/brain_handshake.c \
           $(SRCDIR)/channel_bandit.c \
           $(SRCDIR)/stealth.c \
@@ -94,6 +95,9 @@ $(BINDIR):
 # Compile object files
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# Include auto-generated dependency files (created by -MMD -MP)
+-include $(OBJECTS:.o=.d)
 
 # Link executable
 $(TARGET): $(OBJECTS) | $(BINDIR)

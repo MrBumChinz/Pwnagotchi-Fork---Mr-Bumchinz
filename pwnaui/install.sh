@@ -104,6 +104,12 @@ if [[ -f "$SCRIPT_DIR/scripts/pwnaui_wifi_recovery.sh" ]]; then
     install -m 755 scripts/pwnaui_wifi_recovery.sh "$INSTALL_PREFIX/bin/pwnaui_wifi_recovery"
 fi
 
+# Hostname sync script — syncs hostname to pwnagotchi name for mDNS
+if [[ -f "$SCRIPT_DIR/scripts/pwnaui-hostname-sync" ]]; then
+    log_info "Installing hostname sync script..."
+    install -m 755 scripts/pwnaui-hostname-sync "$INSTALL_PREFIX/bin/pwnaui-hostname-sync"
+fi
+
 # Systemd service (update display type)
 sed "s/waveshare2in13_v2/$DISPLAY_TYPE/g" pwnaui.service > /tmp/pwnaui.service
 install -m 644 /tmp/pwnaui.service "$SYSTEMD_DIR/pwnaui.service"

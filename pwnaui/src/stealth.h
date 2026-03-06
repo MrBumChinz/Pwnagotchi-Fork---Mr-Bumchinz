@@ -121,6 +121,7 @@ typedef struct {
 
     /* Statistics */
     int total_mac_rotations;
+    int mac_rotation_failures;      /* Consecutive failures for backoff */
     int wids_detections;
     int whitelisted_skips;
     int throttled_deauths;

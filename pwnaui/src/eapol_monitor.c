@@ -504,12 +504,69 @@ static void parse_frame(eapol_monitor_t *mon, const uint8_t *buf, int len) {
 }
 
 /* ============================================================================
+ * Socket re-creation helper (for interface down/up cycles)
+ * ============================================================================ */
+
+static int recreate_socket(eapol_monitor_t *mon) {
+    /* Close old socket */
+    if (mon->sock_fd >= 0) {
+        close(mon->sock_fd);
+        mon->sock_fd = -1;
+    }
+
+    /* Create new raw socket */
+    mon->sock_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (mon->sock_fd < 0) {
+        perror("[EAPOL Monitor] socket() re-create failed");
+        return -1;
+    }
+
+    /* Bind to interface */
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    memcpy(ifr.ifr_name, mon->iface, sizeof(ifr.ifr_name) - 1);
+    ifr.ifr_name[sizeof(ifr.ifr_name) - 1] = '\0';
+    if (ioctl(mon->sock_fd, SIOCGIFINDEX, &ifr) < 0) {
+        fprintf(stderr, "[EAPOL Monitor] Interface %s not found on re-create: %s\n",
+                mon->iface, strerror(errno));
+        close(mon->sock_fd);
+        mon->sock_fd = -1;
+        return -1;
+    }
+
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_ALL);
+    sll.sll_ifindex = ifr.ifr_ifindex;
+    if (bind(mon->sock_fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+        perror("[EAPOL Monitor] bind() failed on re-create");
+        close(mon->sock_fd);
+        mon->sock_fd = -1;
+        return -1;
+    }
+
+    /* Restore timeout */
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = EAPOL_MON_TIMEOUT_MS * 1000;
+    setsockopt(mon->sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    printf("[EAPOL Monitor] Socket re-created on %s (fd=%d)\n",
+           mon->iface, mon->sock_fd);
+    return 0;
+}
+
+/* ============================================================================
  * Capture thread
  * ============================================================================ */
+
+#define EAPOL_ENETDOWN_RECREATE_THRESHOLD 5  /* After 5 consecutive ENETDOWN (10s), re-create socket */
 
 static void *capture_thread(void *arg) {
     eapol_monitor_t *mon = (eapol_monitor_t *)arg;
     uint8_t buf[EAPOL_MON_SNAP_LEN];
+    int enetdown_count = 0;
 
     printf("[EAPOL Monitor] Capture thread started on %s\n", mon->iface);
 
@@ -518,9 +575,26 @@ static void *capture_thread(void *arg) {
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             if (errno == ENETDOWN || errno == ENXIO) {
-                /* Interface went down — wait and retry */
-                printf("[EAPOL Monitor] Interface %s down, retrying in 2s...\n", mon->iface);
-                sleep(2);
+                enetdown_count++;
+                if (enetdown_count >= EAPOL_ENETDOWN_RECREATE_THRESHOLD) {
+                    /* Interface likely destroyed and re-created — socket is stale */
+                    printf("[EAPOL Monitor] %s down for %ds, re-creating socket...\n",
+                           mon->iface, enetdown_count * 2);
+                    sleep(5);  /* Wait for interface to stabilize */
+                    if (recreate_socket(mon) == 0) {
+                        enetdown_count = 0;
+                        printf("[EAPOL Monitor] Socket recovery successful\n");
+                    } else {
+                        /* Re-create failed — back off longer */
+                        printf("[EAPOL Monitor] Socket re-create failed, waiting 10s...\n");
+                        sleep(10);
+                    }
+                } else {
+                    /* Transient — wait and retry on same socket */
+                    printf("[EAPOL Monitor] Interface %s down, retrying in 2s... (%d/%d)\n",
+                           mon->iface, enetdown_count, EAPOL_ENETDOWN_RECREATE_THRESHOLD);
+                    sleep(2);
+                }
                 continue;
             }
             perror("[EAPOL Monitor] recv error");
@@ -528,6 +602,8 @@ static void *capture_thread(void *arg) {
         }
         if (n == 0) continue;
 
+        /* Reset ENETDOWN counter on successful recv */
+        enetdown_count = 0;
         parse_frame(mon, buf, n);
     }
 
@@ -591,21 +667,50 @@ int eapol_monitor_init(eapol_monitor_t *mon, const char *iface) {
     /*
      * Attach BPF filter to only receive EAPOL frames.
      *
-     * This is a simplified filter — the real filtering is done in parse_frame()
-     * after radiotap/802.11 header parsing, but the BPF reduces wakeups by
-     * filtering out the vast majority of non-EAPOL traffic at kernel level.
+     * 802.11 data frames carry EAPOL via LLC/SNAP with ethertype 0x888e.
+     * Radiotap header length varies (typically 18-36 bytes), and the 802.11
+     * MAC header is 24 bytes (or 30 with QoS). LLC/SNAP adds 8 bytes, with
+     * the ethertype at offset +6 within LLC.
      *
-     * The filter matches any packet that contains 0x888e (EAPOL ethertype)
-     * anywhere in the LLC/SNAP region of an 802.11 data frame.
-     * Since radiotap length varies, we use a permissive filter and validate
-     * fully in userspace.
+     * We check for 0x888e at several common absolute offsets where the
+     * ethertype would appear in practice. This catches ~95% of non-EAPOL
+     * traffic at kernel level. False positives are filtered in parse_frame().
+     *
+     * Common layouts:
+     *   radiotap(18) + 802.11(24) + LLC(6) = offset 48
+     *   radiotap(18) + 802.11(26/QoS) + LLC(6) = offset 50
+     *   radiotap(20) + 802.11(26/QoS) + LLC(6) = offset 52
+     *   radiotap(24) + 802.11(24) + LLC(6) = offset 54
+     *   radiotap(24) + 802.11(26/QoS) + LLC(6) = offset 56
+     *   radiotap(36) + 802.11(24) + LLC(6) = offset 66
+     *   radiotap(36) + 802.11(26/QoS) + LLC(6) = offset 68
      */
     struct sock_filter bpf_code[] = {
-        /* Accept all packets — we filter in userspace after radiotap parsing.
-         * A kernel-level BPF for 802.11 EAPOL is complex due to variable
-         * radiotap header length. The recv() timeout keeps CPU low even
-         * without aggressive BPF filtering. */
+        /* Load half-word at offset 48: radiotap(18) + 802.11(24) + LLC(6) */
+        { BPF_LD  | BPF_H | BPF_ABS, 0, 0, 48 },
+        { BPF_JMP | BPF_JEQ | BPF_K, 12, 0, 0x888e },  /* match → accept (skip 12) */
+        /* Load half-word at offset 50: radiotap(18) + 802.11(26/QoS) + LLC(6) */
+        { BPF_LD  | BPF_H | BPF_ABS, 0, 0, 50 },
+        { BPF_JMP | BPF_JEQ | BPF_K, 10, 0, 0x888e },
+        /* Load half-word at offset 52: radiotap(20) + 802.11(26/QoS) + LLC(6) */
+        { BPF_LD  | BPF_H | BPF_ABS, 0, 0, 52 },
+        { BPF_JMP | BPF_JEQ | BPF_K, 8, 0, 0x888e },
+        /* Load half-word at offset 54: radiotap(24) + 802.11(24) + LLC(6) */
+        { BPF_LD  | BPF_H | BPF_ABS, 0, 0, 54 },
+        { BPF_JMP | BPF_JEQ | BPF_K, 6, 0, 0x888e },
+        /* Load half-word at offset 56: radiotap(24) + 802.11(26/QoS) + LLC(6) */
+        { BPF_LD  | BPF_H | BPF_ABS, 0, 0, 56 },
+        { BPF_JMP | BPF_JEQ | BPF_K, 4, 0, 0x888e },
+        /* Load half-word at offset 66: radiotap(36) + 802.11(24) + LLC(6) */
+        { BPF_LD  | BPF_H | BPF_ABS, 0, 0, 66 },
+        { BPF_JMP | BPF_JEQ | BPF_K, 2, 0, 0x888e },
+        /* Load half-word at offset 68: radiotap(36) + 802.11(26/QoS) + LLC(6) */
+        { BPF_LD  | BPF_H | BPF_ABS, 0, 0, 68 },
+        { BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0x888e },
+        /* Accept */
         { BPF_RET | BPF_K, 0, 0, EAPOL_MON_SNAP_LEN },
+        /* Reject */
+        { BPF_RET | BPF_K, 0, 0, 0 },
     };
     struct sock_fprog bpf = {
         .len = sizeof(bpf_code) / sizeof(bpf_code[0]),
@@ -614,6 +719,9 @@ int eapol_monitor_init(eapol_monitor_t *mon, const char *iface) {
     if (setsockopt(mon->sock_fd, SOL_SOCKET, SO_ATTACH_FILTER, &bpf, sizeof(bpf)) < 0) {
         /* Non-fatal — we'll just get more frames to filter in userspace */
         perror("[EAPOL Monitor] BPF attach failed (non-fatal)");
+    } else {
+        fprintf(stderr, "[EAPOL Monitor] BPF filter attached (%u instructions, 7 offsets)\n",
+                (unsigned)bpf.len);
     }
 
     printf("[EAPOL Monitor] Initialized on %s (fd=%d)\n", mon->iface, mon->sock_fd);

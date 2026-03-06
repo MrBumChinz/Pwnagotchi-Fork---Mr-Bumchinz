@@ -12,15 +12,21 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <ctype.h>
 #include "webserver.h"
 #include "cJSON.h"
 #include "attack_log.h"
+#include "ap_database.h"
 #include <dirent.h>
 static webserver_state_callback_t g_state_cb = NULL;
 static webserver_gps_callback_t g_gps_cb = NULL;
+static webserver_name_callback_t g_name_cb = NULL;
 
 void webserver_set_gps_callback(webserver_gps_callback_t cb) {
     g_gps_cb = cb;
+}
+void webserver_set_name_callback(webserver_name_callback_t cb) {
+    g_name_cb = cb;
 }
 /* Theme faces directory - will be set dynamically based on current theme */
 #define THEME_BASE "/home/pi/pwnaui/themes"
@@ -172,7 +178,7 @@ int webserver_init(int port) {
     set_nonblocking(server_fd);
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY); /* Bind all interfaces so phone/PC can access */
     addr.sin_port = htons(port);
     if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("webserver bind");
@@ -184,7 +190,7 @@ int webserver_init(int port) {
         close(server_fd);
         return -1;
     }
-    printf("[WEB] Server listening on port %d\n", port);
+    printf("[WEB] Server listening on 0.0.0.0:%d\n", port);
     return server_fd;
 }
 void webserver_set_state_callback(webserver_state_callback_t cb) {
@@ -252,143 +258,190 @@ static int serve_png(int client_fd, const char *filename) {
     return 1;
 }
 
-/* === Sprint 5: Crack City API === */
-static void serve_crackcity_api(int client_fd) {
-    cJSON *root = cJSON_CreateObject();
+/* === Name change API — POST /api/config/name === */
+/* Updates config.toml, system hostname, and avahi so mDNS resolves the new name.
+ * Mobile app sends: POST /api/config/name  {"name":"Sniffles"}
+ * After this, http://sniffles.local/crackcity works. */
+static void serve_config_name_api(int client_fd, const char *request, ssize_t req_len) {
+    /* Find JSON body after headers (\r\n\r\n) */
+    const char *body = strstr(request, "\r\n\r\n");
+    if (!body) {
+        const char *err = "{\"error\":\"no body\"}";
+        send_response(client_fd, "400 Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+    body += 4;
 
-    /* Current GPS */
-    cJSON *gps_obj = cJSON_CreateObject();
+    /* Parse "name" from JSON (simple extraction — no full JSON parser needed) */
+    const char *nkey = strstr(body, "\"name\"");
+    if (!nkey) {
+        const char *err = "{\"error\":\"missing name field\"}";
+        send_response(client_fd, "400 Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+    const char *q1 = strchr(nkey + 6, '"');
+    if (!q1) { send_response(client_fd, "400 Bad Request", "application/json", "{\"error\":\"bad json\"}", 20); return; }
+    const char *q2 = strchr(q1 + 1, '"');
+    if (!q2) { send_response(client_fd, "400 Bad Request", "application/json", "{\"error\":\"bad json\"}", 20); return; }
+
+    size_t name_len = q2 - q1 - 1;
+    if (name_len == 0 || name_len > 24) {
+        const char *err = "{\"error\":\"name must be 1-24 chars\"}";
+        send_response(client_fd, "400 Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    char new_name[64];
+    memcpy(new_name, q1 + 1, name_len);
+    new_name[name_len] = '\0';
+
+    /* Validate: alphanumeric, hyphens, underscores only */
+    for (size_t i = 0; i < name_len; i++) {
+        char c = new_name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+            const char *err = "{\"error\":\"invalid chars in name\"}";
+            send_response(client_fd, "400 Bad Request", "application/json", err, strlen(err));
+            return;
+        }
+    }
+
+    /* 1. Update config.toml — read, replace name line, write back */
+    {
+        FILE *f = fopen("/etc/pwnagotchi/config.toml", "r");
+        char *content = NULL;
+        long fsize = 0;
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            fsize = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            content = malloc(fsize + 1);
+            if (content) { fread(content, 1, fsize, f); content[fsize] = '\0'; }
+            fclose(f);
+        }
+        FILE *fw = fopen("/etc/pwnagotchi/config.toml", "w");
+        if (fw) {
+            if (content) {
+                /* Replace existing name = "..." line */
+                int replaced = 0;
+                char *line_start = content;
+                while (line_start && *line_start) {
+                    char *line_end = strchr(line_start, '\n');
+                    size_t ll = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
+                    /* Check if this is a top-level name = "..." (not inside [section]) */
+                    if (!replaced && line_start[0] != '[' && strstr(line_start, "name") &&
+                        strstr(line_start, "=") && (strstr(line_start, "=") < line_start + ll)) {
+                        /* Make sure it's "name" not "phone-name" etc */
+                        char *eq = strstr(line_start, "=");
+                        char tmp[64];
+                        size_t klen = eq - line_start;
+                        if (klen < sizeof(tmp)) {
+                            memcpy(tmp, line_start, klen); tmp[klen] = '\0';
+                            /* Trim whitespace */
+                            char *k = tmp; while (*k == ' ' || *k == '\t') k++;
+                            char *ke = k + strlen(k) - 1;
+                            while (ke > k && (*ke == ' ' || *ke == '\t')) *ke-- = '\0';
+                            if (strcmp(k, "name") == 0) {
+                                fprintf(fw, "name = \"%s\"\n", new_name);
+                                replaced = 1;
+                                line_start = line_end ? line_end + 1 : NULL;
+                                continue;
+                            }
+                        }
+                    }
+                    fwrite(line_start, 1, ll, fw);
+                    if (line_end) { fputc('\n', fw); line_start = line_end + 1; }
+                    else break;
+                }
+                if (!replaced) {
+                    /* No existing name line — add one at the top */
+                    fprintf(fw, "name = \"%s\"\n", new_name);
+                }
+            } else {
+                /* No existing config — create minimal one */
+                fprintf(fw, "name = \"%s\"\n", new_name);
+            }
+            fclose(fw);
+        }
+        free(content);
+    }
+
+    /* 2. Update system hostname + avahi for mDNS */
+    {
+        char hostname[64];
+        size_t hi = 0;
+        for (size_t i = 0; i < name_len && hi < sizeof(hostname) - 1; i++) {
+            char c = new_name[i];
+            if ((c >= 'A' && c <= 'Z')) c += 32; /* lowercase */
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')
+                hostname[hi++] = c;
+        }
+        hostname[hi] = '\0';
+        if (hi == 0) strcpy(hostname, "pwnagotchi");
+
+        /* Set hostname + /etc/hostname + restart avahi */
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd),
+            "hostname '%s'; echo '%s' > /etc/hostname; "
+            "sed -i 's/127.0.1.1.*/127.0.1.1\\t%s/' /etc/hosts; "
+            "systemctl restart avahi-daemon 2>/dev/null",
+            hostname, hostname, hostname);
+        system(cmd);
+    }
+
+    /* 3. Notify pwnaui to update display name */
+    if (g_name_cb) {
+        g_name_cb(new_name);
+    }
+
+    char resp[128];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"name\":\"%s\"}", new_name);
+    send_response(client_fd, "200 OK", "application/json", resp, strlen(resp));
+}
+
+/* === Sprint 5: Crack City API (v2 — pure SQL, no file scanning) === */
+static void serve_crackcity_api(int client_fd) {
+    /* Current GPS — prepend to the DB-generated JSON */
+    char gps_json[256] = "\"current_gps\":{\"lat\":0,\"lon\":0,\"has_fix\":false}";
     if (g_gps_cb) {
         double lat = 0, lon = 0;
         int has_fix = 0;
         g_gps_cb(&lat, &lon, &has_fix);
-        cJSON_AddNumberToObject(gps_obj, "lat", lat);
-        cJSON_AddNumberToObject(gps_obj, "lon", lon);
-        cJSON_AddBoolToObject(gps_obj, "has_fix", has_fix);
-    }
-    cJSON_AddItemToObject(root, "current_gps", gps_obj);
-
-    /* Scan handshakes directory */
-    cJSON *networks = cJSON_CreateArray();
-    int total = 0, with_gps = 0, cracked_count = 0;
-
-    DIR *dir = opendir("/home/pi/handshakes");
-    if (dir) {
-        struct dirent *ent;
-        while ((ent = readdir(dir)) != NULL) {
-            /* Only process .pcap files (not .pcapng duplicates) */
-            size_t nlen = strlen(ent->d_name);
-            if (nlen < 6) continue;
-            if (strcmp(ent->d_name + nlen - 5, ".pcap") != 0) continue;
-            /* Skip .pcapng (ends in .pcapng not .pcap) */
-            if (nlen > 7 && strcmp(ent->d_name + nlen - 7, ".pcapng") == 0) continue;
-
-            total++;
-
-            /* Parse SSID and BSSID from filename: SSID_bssid.pcap */
-            char ssid[64] = {0};
-            char bssid_hex[13] = {0};
-            char bssid_str[18] = {0};
-            char *underscore = strrchr(ent->d_name, '_');
-            if (!underscore) continue;
-
-            size_t ssid_len = underscore - ent->d_name;
-            if (ssid_len >= sizeof(ssid)) ssid_len = sizeof(ssid) - 1;
-            strncpy(ssid, ent->d_name, ssid_len);
-
-            char *bssid_start = underscore + 1;
-            char *dot = strchr(bssid_start, '.');
-            if (dot) {
-                size_t blen = dot - bssid_start;
-                if (blen == 12) {
-                    strncpy(bssid_hex, bssid_start, 12);
-                    snprintf(bssid_str, sizeof(bssid_str),
-                        "%c%c:%c%c:%c%c:%c%c:%c%c:%c%c",
-                        bssid_hex[0],bssid_hex[1],bssid_hex[2],bssid_hex[3],
-                        bssid_hex[4],bssid_hex[5],bssid_hex[6],bssid_hex[7],
-                        bssid_hex[8],bssid_hex[9],bssid_hex[10],bssid_hex[11]);
-                }
-            }
-
-            /* Read GPS data from .gps.json (named {SSID}_{BSSID}.gps.json) */
-            double lat = 0, lon = 0;
-            int has_gps = 0;
-            char gps_path[512];
-            /* Strip .pcap extension to get base name, then look for .gps.json */
-            char baseName[256];
-            strncpy(baseName, ent->d_name, sizeof(baseName) - 1);
-            baseName[sizeof(baseName) - 1] = '\0';
-            char *dotExt = strrchr(baseName, '.');
-            if (dotExt) *dotExt = '\0';
-            snprintf(gps_path, sizeof(gps_path), "/home/pi/handshakes/%s.gps.json", baseName);
-            FILE *gf = fopen(gps_path, "r");
-            if (gf) {
-                char gps_buf[1024];
-                size_t gn = fread(gps_buf, 1, sizeof(gps_buf)-1, gf);
-                gps_buf[gn] = '\0';
-                fclose(gf);
-                cJSON *gj = cJSON_Parse(gps_buf);
-                if (gj) {
-                    cJSON *jlat = cJSON_GetObjectItem(gj, "Latitude");
-                    if (!jlat) jlat = cJSON_GetObjectItem(gj, "latitude");
-                    cJSON *jlon = cJSON_GetObjectItem(gj, "Longitude");
-                    if (!jlon) jlon = cJSON_GetObjectItem(gj, "longitude");
-                    if (jlat && cJSON_IsNumber(jlat)) lat = jlat->valuedouble;
-                    if (jlon && cJSON_IsNumber(jlon)) lon = jlon->valuedouble;
-                    if (lat != 0.0 || lon != 0.0) has_gps = 1;
-                    cJSON_Delete(gj);
-                }
-                if (has_gps) with_gps++;
-            }
-
-            /* Check if cracked */
-            char key_path[256], password[128] = {0};
-            int is_cracked = 0;
-            snprintf(key_path, sizeof(key_path), "/home/pi/cracked/%s.key", ssid);
-            FILE *kf = fopen(key_path, "r");
-            if (kf) {
-                size_t kn = fread(password, 1, sizeof(password)-1, kf);
-                password[kn] = '\0';
-                char *nl = strchr(password, '\n');
-                if (nl) *nl = '\0';
-                char *cr = strchr(password, '\r');
-                if (cr) *cr = '\0';
-                fclose(kf);
-                is_cracked = 1;
-                cracked_count++;
-            }
-
-            /* Build network entry */
-            cJSON *net = cJSON_CreateObject();
-            cJSON_AddStringToObject(net, "ssid", ssid);
-            cJSON_AddStringToObject(net, "bssid", bssid_str);
-            cJSON_AddNumberToObject(net, "lat", lat);
-            cJSON_AddNumberToObject(net, "lon", lon);
-            cJSON_AddBoolToObject(net, "has_gps", has_gps);
-            cJSON_AddBoolToObject(net, "cracked", is_cracked);
-            cJSON_AddStringToObject(net, "password", password);
-            cJSON_AddStringToObject(net, "filename", ent->d_name);
-            cJSON_AddItemToArray(networks, net);
-        }
-        closedir(dir);
+        snprintf(gps_json, sizeof(gps_json),
+            "\"current_gps\":{\"lat\":%.8f,\"lon\":%.8f,\"has_fix\":%s}",
+            lat, lon, has_fix ? "true" : "false");
     }
 
-    cJSON_AddItemToObject(root, "networks", networks);
-    cJSON *stats = cJSON_CreateObject();
-    cJSON_AddNumberToObject(stats, "total", total);
-    cJSON_AddNumberToObject(stats, "with_gps", with_gps);
-    cJSON_AddNumberToObject(stats, "cracked", cracked_count);
-    cJSON_AddItemToObject(root, "stats", stats);
-
-    char *json_str = cJSON_PrintUnformatted(root);
-    if (json_str) {
-        send_response(client_fd, "200 OK", "application/json", json_str, strlen(json_str));
-        free(json_str);
-    } else {
-        const char *err = "{\"error\":\"json\"}";
+    /* Get networks + stats from DB in one fast SQL query */
+    char *db_json = NULL;
+    if (ap_db_crackcity_json(&db_json) != 0 || !db_json) {
+        const char *err = "{\"error\":\"db\"}";
         send_response(client_fd, "500 Internal Server Error", "application/json", err, strlen(err));
+        return;
     }
-    cJSON_Delete(root);
+
+    /* Merge: insert current_gps into the DB JSON */
+    /* db_json is: {"networks":[...],"stats":{...}} */
+    /* We want:    {"current_gps":{...},"networks":[...],"stats":{...}} */
+    size_t gps_len = strlen(gps_json);
+    size_t db_len = strlen(db_json);
+    char *merged = malloc(gps_len + db_len + 4);  /* {gps,db_without_leading_brace} */
+    if (!merged) {
+        free(db_json);
+        const char *err = "{\"error\":\"oom\"}";
+        send_response(client_fd, "500 Internal Server Error", "application/json", err, strlen(err));
+        return;
+    }
+    merged[0] = '{';
+    memcpy(merged + 1, gps_json, gps_len);
+    merged[1 + gps_len] = ',';
+    /* Skip the leading '{' of db_json */
+    memcpy(merged + 2 + gps_len, db_json + 1, db_len - 1);
+    merged[1 + gps_len + db_len] = '\0';
+
+    send_response(client_fd, "200 OK", "application/json", merged, strlen(merged));
+    free(merged);
+    free(db_json);
 }
 
 /* === Sprint 5: Attack Log API === */
@@ -471,6 +524,14 @@ int webserver_poll(int server_fd) {
         if (query) len = query - (request + 12);
         strncpy(filename, request + 12, len);
         filename[len] = '\0';
+
+        /* T293: Sanitize filename — reject path traversal attempts */
+        if (strstr(filename, "..") || strchr(filename, '\0') != filename + strlen(filename) ||
+            memchr(filename, '\0', len) != NULL || strchr(filename, '/') || strchr(filename, '\\')) {
+            const char *msg = "Invalid filename";
+            send_response(client_fd, "400 Bad Request", "text/plain", msg, strlen(msg));
+        } else {
+
         char filepath[512];
         snprintf(filepath, sizeof(filepath), "/home/pi/pwnaui/assets/%s", filename);
         FILE *fp = fopen(filepath, "rb");
@@ -501,6 +562,7 @@ int webserver_poll(int server_fd) {
             const char *msg = "Asset not found";
             send_response(client_fd, "404 Not Found", "text/plain", msg, strlen(msg));
         }
+        } /* end T293 sanitize else */
     } else if (strncmp(request, "GET /api/crackcity", 18) == 0) {
         /* Sprint 5: Crack City API */
         serve_crackcity_api(client_fd);
@@ -508,6 +570,10 @@ int webserver_poll(int server_fd) {
     } else if (strncmp(request, "GET /api/attacks", 16) == 0) {
         /* Sprint 5: Attack log API */
         serve_attacks_api(client_fd);
+
+    } else if (strncmp(request, "POST /api/config/name", 21) == 0) {
+        /* Name change API — mobile app sets pwnagotchi name */
+        serve_config_name_api(client_fd, request, n);
 
     } else if (strncmp(request, "GET /crackcity", 14) == 0) {
         /* Sprint 5: Crack City page */

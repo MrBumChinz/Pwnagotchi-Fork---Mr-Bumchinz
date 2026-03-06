@@ -5,7 +5,7 @@
 # replaced with placeholders. Fill in your own values.
 
 [main]
-name = "pwnagotchi"
+name = "Sniffles"
 lang = "en"
 whitelist = []
 confd = "/etc/pwnagotchi/conf.d/"
@@ -127,6 +127,13 @@ whitelist_ssids = []
 auto_connect_safe = true
 unsafe_mode = false
 auto_connect_unsafe = false
+
+# Whitelist-to-community extraction:
+# When a user adds their network to whitelist_ssids WITH a password,
+# the password is automatically added to community.txt and synced to fleet.
+# Format: whitelist_passwords is auto-populated from networks the user
+# has whitelisted — their own WiFi passwords contribute to the community list.
+whitelist_extract_to_community = true
 
 [main.plugins.pwnhub_stats]
 enabled = true
