@@ -19,6 +19,10 @@
 static int g_display_width = 250;
 static int g_display_height = 122;
 
+/* Forward declarations */
+static void renderer_draw_rect_simple(uint8_t *framebuffer, int width, int height,
+                                     int x, int y, int w, int h, int color, int filled);
+
 /* Layout presets matching Pwnagotchi display configurations */
 typedef struct {
     const char *name;
@@ -251,6 +255,7 @@ void renderer_set_pixel(uint8_t *framebuffer, int width, int x, int y, int color
 /*
  * Get a pixel from framebuffer
  */
+static int get_pixel(uint8_t *framebuffer, int width, int x, int y) __attribute__((unused));
 static int get_pixel(uint8_t *framebuffer, int width, int x, int y) {
     if (x < 0 || x >= width || y < 0 || y >= g_display_height) {
         return 1;  /* White for out of bounds */
@@ -371,7 +376,7 @@ void renderer_draw_text(ui_state_t *state, uint8_t *framebuffer,
     if (!text || !text[0]) return;
     
     int color = state->invert ? 1 : 0;  /* Black text */
-    int bg_color = state->invert ? 0 : 1;  /* White background */
+    int bg_color __attribute__((unused)) = state->invert ? 0 : 1;  /* White background */
     
     /* Scale factor for FONT_HUGE (faces) - use 1.5x (3 pixels for every 2) */
     int use_15x_scale = (font_id == FONT_HUGE) ? 1 : 0;
@@ -748,7 +753,7 @@ void renderer_draw_line_simple(uint8_t *framebuffer, int width, int height,
     g_display_height = old_height;
 }
 
-void renderer_draw_rect_simple(uint8_t *framebuffer, int width, int height,
+static void renderer_draw_rect_simple(uint8_t *framebuffer, int width, int height,
                                int x, int y, int w, int h, int color, int filled) {
     if (filled) {
         for (int row = y; row < y + h && row < height; row++) {
