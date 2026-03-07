@@ -111,6 +111,11 @@ void renderer_draw_icon(uint8_t *fb, int fb_width, int fb_height, int x, int y, 
 /* Line rendering */
 void renderer_draw_line_fb(uint8_t *fb, int fb_width, int fb_height, int x1, int y1, int x2, int y2);
 
+/* Pixel access */
+void renderer_set_pixel(uint8_t *framebuffer, int width, int x, int y, int color);
+int renderer_get_width(void);
+int renderer_get_height(void);
+
 /* Layout management */
 void renderer_set_layout(const char *layout_name);
 
