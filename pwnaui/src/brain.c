@@ -620,8 +620,8 @@ brain_config_t brain_config_default(void) {
                      .sync_interval = 21600, .enabled = true },       /* Must be reasonably close */
 
         /* Sprint 6: Stealth enhancements */
-        .mac_rotation_enabled = true,
-        .mac_rotation_interval = 1800,  /* 30 minutes */
+        .mac_rotation_enabled = false,  /* disabled: breaks brcmfmac/nexmon wifi */
+        .mac_rotation_interval = 1800,  /* 30 minutes when enabled */
         .tx_power_min = 5,
         .tx_power_max = 30,
 

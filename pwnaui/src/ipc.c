@@ -51,8 +51,8 @@ int ipc_server_create(const char *socket_path) {
         return -1;
     }
     
-    /* Set socket permissions (accessible by pwnagotchi user) */
-    chmod(socket_path, 0660); /* T359: restrict to owner+group only */
+    /* Set socket permissions (accessible by pwnagotchi user only) T359 */
+    chmod(socket_path, 0660);
     
     /* Listen */
     if (listen(fd, SOCKET_BACKLOG) < 0) {

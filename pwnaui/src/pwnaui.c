@@ -455,7 +455,10 @@ static const char *get_random_voice(const char **messages) {
 #define POTFILE_PATH "/home/pi/handshakes/wpa-sec.cracked.potfile"
 #define XP_FILE "/var/lib/pwnagotchi/pwnhub_xp.txt"
 #define FOOD_FILE "/var/lib/pwnagotchi/pwnhub_food.txt"
+#define STRENGTH_FILE "/var/lib/pwnagotchi/pwnhub_strength.txt"
+#define SPIRIT_FILE "/var/lib/pwnagotchi/pwnhub_spirit.txt"
 #define FOOD_MAX 1000
+#define STRENGTH_MAX 1000
 
 /* Pcap cache - stores mtime and parsed result to avoid re-parsing unchanged files */
 typedef struct {
@@ -504,6 +507,28 @@ static void save_food_state(int food) {
     FILE *f = fopen(FOOD_FILE, "w");
     if (f) {
         fprintf(f, "%d\n", food);
+        fflush(f);
+        fsync(fileno(f));
+        fclose(f);
+    }
+}
+
+/* Save strength state to disk */
+static void save_strength_state(int strength) {
+    FILE *f = fopen(STRENGTH_FILE, "w");
+    if (f) {
+        fprintf(f, "%d\n", strength);
+        fflush(f);
+        fsync(fileno(f));
+        fclose(f);
+    }
+}
+
+/* Save spirit state to disk */
+static void save_spirit_state(int spirit) {
+    FILE *f = fopen(SPIRIT_FILE, "w");
+    if (f) {
+        fprintf(f, "%d\n", spirit);
         fflush(f);
         fsync(fileno(f));
         fclose(f);
@@ -982,7 +1007,85 @@ static void brain_epoch_callback(int epoch_num, const brain_epoch_t *data, void 
         /* Save food state every epoch (survives power loss) */
         save_food_state(food);
     }
-    
+
+    /* UPDATE PWNHUB STRENGTH (attack sharpness — locally calculated) */
+    {
+        static int strength = -1;   /* -1 = not yet loaded */
+        static int str_prev_fhs = 0;
+        static int str_prev_phs = 0;
+
+        /* Load strength from file on first call */
+        if (strength < 0) {
+            FILE *f = fopen(STRENGTH_FILE, "r");
+            if (f) {
+                if (fscanf(f, "%d", &strength) != 1) strength = 0;
+                fclose(f);
+            }
+            if (strength < 0) strength = 0;
+            str_prev_fhs = g_ui_state.fhs;
+            str_prev_phs = g_ui_state.phs;
+            fprintf(stderr, "[strength] Loaded strength: %d\n", strength);
+        }
+
+        /* Award strength for attacks and captures */
+        int str_earned = 0;
+        int s_new_fhs = g_ui_state.fhs - str_prev_fhs;
+        int s_new_phs = g_ui_state.phs - str_prev_phs;
+        if (s_new_fhs > 0) { str_earned += s_new_fhs * 50; str_prev_fhs = g_ui_state.fhs; }
+        if (s_new_phs > 0) { str_earned += s_new_phs * 20; str_prev_phs = g_ui_state.phs; }
+        str_earned += (data->num_deauths + data->num_assocs) * 8;
+        strength += str_earned;
+
+        /* Drain when idle (slower than food) */
+        if (str_earned == 0) {
+            strength -= 2;
+        }
+        if (strength < 0) strength = 0;
+        if (strength > STRENGTH_MAX) strength = STRENGTH_MAX;
+
+        /* Map to percentage */
+        int str_pct = (strength * 100) / STRENGTH_MAX;
+        if (str_pct > 100) str_pct = 100;
+        g_ui_state.pwnhub_strength = str_pct;
+
+        save_strength_state(strength);
+    }
+
+    /* UPDATE PWNHUB SPIRIT (morale — persisted and locally regenerated) */
+    {
+        static int spirit = -1;     /* -1 = not yet loaded */
+
+        /* Load spirit from file on first call */
+        if (spirit < 0) {
+            FILE *f = fopen(SPIRIT_FILE, "r");
+            if (f) {
+                if (fscanf(f, "%d", &spirit) != 1) spirit = 50;
+                fclose(f);
+            }
+            if (spirit < 0) spirit = 50;  /* Default to 50% on fresh install */
+            fprintf(stderr, "[spirit] Loaded spirit: %d%%\n", spirit);
+        }
+
+        /* Spirit regen based on food level */
+        int food_pct_local = g_ui_state.pwnhub_food;
+        if (food_pct_local > 75) {
+            spirit += 2;    /* Well-fed: fast regen */
+        } else if (food_pct_local > 50) {
+            spirit += 1;    /* Fed: slow regen */
+        } else if (food_pct_local < 10) {
+            spirit -= 1;    /* Starving: drain */
+        }
+        /* Spirit also gets a small boost from successful attacks */
+        if (data->num_deauths > 0 || data->num_assocs > 0) {
+            spirit += 1;
+        }
+        if (spirit < 0) spirit = 0;
+        if (spirit > 100) spirit = 100;
+        g_ui_state.pwnhub_spirit = spirit;
+
+        save_spirit_state(spirit);
+    }
+
     /* UPDATE XP PROGRESSION - Prestige System with Persistence */
     {
         static int total_xp = -1;  /* -1 = not yet loaded */
@@ -1342,7 +1445,7 @@ static void webserver_state_cb(char *buf, size_t bufsize) {
         "\"aps\":\"%s\",\"uptime\":\"%s\",\"shakes\":\"%s\","
         "\"mode\":\"%s\",\"name\":\"%s\",\"bluetooth\":\"%s\","
         "\"battery\":\"%s\",\"gps\":\"%s\",\"pwds\":%d,\"fhs\":%d,\"phs\":%d,\"tcaps\":%d,"
-        "\"memtemp\":\"%s\",\"pwnhub\":%d,\"protein\":%d,\"fat\":%d,\"carbs\":%d,\"xp\":%d,\"lvl\":%d,\"title\":\"%s\",\"wins\":%d,\"battles\":%d}",
+        "\"memtemp\":\"%s\",\"pwnhub\":%d,\"food\":%d,\"strength\":%d,\"spirit\":%d,\"xp\":%d,\"lvl\":%d,\"title\":\"%s\",\"wins\":%d,\"battles\":%d}",
         g_ui_state.face, face_png ? face_png : "", g_ui_state.status, g_ui_state.channel,
         g_ui_state.aps, g_ui_state.uptime, g_ui_state.shakes,
         g_ui_state.mode, g_ui_state.name, g_ui_state.bluetooth,
@@ -1382,6 +1485,34 @@ static void init_ui_state(void) {
     g_ui_state.pwnhub_food = 0;
     g_ui_state.pwnhub_strength = 0;
     g_ui_state.pwnhub_spirit = 0;
+    /* Load persisted strength/spirit immediately so icons display from boot */
+    {
+        int val;
+        FILE *f;
+        f = fopen(FOOD_FILE, "r");
+        if (f) {
+            if (fscanf(f, "%d", &val) == 1 && val > 0) {
+                g_ui_state.pwnhub_food = (val * 100) / FOOD_MAX;
+                if (g_ui_state.pwnhub_food > 100) g_ui_state.pwnhub_food = 100;
+            }
+            fclose(f);
+        }
+        f = fopen(STRENGTH_FILE, "r");
+        if (f) {
+            if (fscanf(f, "%d", &val) == 1 && val > 0) {
+                g_ui_state.pwnhub_strength = (val * 100) / STRENGTH_MAX;
+                if (g_ui_state.pwnhub_strength > 100) g_ui_state.pwnhub_strength = 100;
+            }
+            fclose(f);
+        }
+        f = fopen(SPIRIT_FILE, "r");
+        if (f) {
+            if (fscanf(f, "%d", &val) == 1) {
+                g_ui_state.pwnhub_spirit = (val < 0) ? 0 : (val > 100) ? 100 : val;
+            }
+            fclose(f);
+        }
+    }
     /* Load persisted XP/level immediately so display is correct from boot */
     {
         int saved_xp = 0;

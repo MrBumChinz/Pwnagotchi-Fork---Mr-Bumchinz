@@ -136,9 +136,11 @@ stealth_config_t stealth_config_default(void) {
         /* Whitelist - empty by default */
         .whitelist_count = 0,
 
-        /* MAC rotation */
-        .mac_rotation_enabled = true,
-        .mac_rotation_interval = 1800,  /* 30 minutes default */
+        /* MAC rotation — disabled by default: brcmfmac/nexmon on Pi Zero W
+         * does not support runtime MAC changes and attempting them tears down
+         * the wifi stack, breaking channel hopping & handshake capture. */
+        .mac_rotation_enabled = false,
+        .mac_rotation_interval = 1800,  /* 30 minutes when enabled */
         .use_realistic_oui = true,
 
         /* Deauth throttling */

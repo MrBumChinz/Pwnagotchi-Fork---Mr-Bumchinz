@@ -816,9 +816,10 @@ static int ws_recv_frame(bcap_ws_ctx_t *ctx) {
     
     /* Receive payload */
     if (payload_len > 0) {
-        /* T355: Hard limit on frame size to prevent memory exhaustion */
+        /* T355: Reject oversized frames (64KB max) to prevent memory exhaustion */
         if (payload_len > 65536) {
-            fprintf(stderr, "[bcap_ws] T355: frame too large (%zu bytes), rejecting\n", payload_len);
+            fprintf(stderr, "[bcap_ws] Frame too large: %llu bytes, dropping\n",
+                    (unsigned long long)payload_len);
             return -1;
         }
         if (payload_len > ctx->frame_capacity) {

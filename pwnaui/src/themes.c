@@ -43,16 +43,16 @@ const char *g_face_state_names[FACE_STATE_COUNT] = {
     "LOOK_R_HAPPY",
     
     /* Sleep animations */
-    "SLEEP1",
+    "SLEEP",
     "SLEEP2",
-    "SLEEP3",
-    "SLEEP4",
+    "SLEEP",
+    "SLEEP2",
     
     /* Upload/Download animations (binary eyes) */
-    "00",
-    "01",
-    "10",
-    "11"
+    "UPLOAD",
+    "UPLOAD1",
+    "UPLOAD2",
+    "UPLOAD"
 };
 
 /* Global animation state */
